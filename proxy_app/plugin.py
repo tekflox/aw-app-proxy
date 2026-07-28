@@ -15,7 +15,9 @@ Ports three previously monolith-only pieces onto the F4 ``ctx`` facades:
 """
 from __future__ import annotations
 
+import json
 import logging
+import shlex
 import sys
 
 from . import routes as routes_mod
@@ -33,7 +35,11 @@ class ProxyAppPlugin:
         ctx.routes.register(subapp)
 
         port = int(ctx.config.get("proxy_port") or 9124)
-        start_cmd = f"{sys.executable} -m proxy_app.proxy_server --port {port}"
+        allowed_networks = ctx.config.get("allowed_networks") or ["127.0.0.0/8"]
+        start_cmd = (
+            f"{sys.executable} -m proxy_app.proxy_server --port {port} "
+            f"--allowed-networks {shlex.quote(json.dumps(allowed_networks))}"
+        )
         ctx.services.register(SERVICE_ID, start_cmd, autostart=True)
 
         log.info("aw-app-proxy activated (service port=%s)", port)

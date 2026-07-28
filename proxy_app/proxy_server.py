@@ -484,11 +484,17 @@ def main():
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--bind", default="0.0.0.0")
     parser.add_argument("--cdp-list-url", default=None)
+    parser.add_argument("--allowed-networks", default=None,
+                         help="JSON list of CIDR ranges allowed to use the CONNECT tunnel "
+                              "(overrides AW_PROXY_ALLOWED_NETWORKS)")
     args = parser.parse_args()
 
-    global _CDP_LIST_URL
+    global _CDP_LIST_URL, _ALLOWED_NETWORKS
     if args.cdp_list_url:
         _CDP_LIST_URL = args.cdp_list_url
+    if args.allowed_networks:
+        _ALLOWED_NETWORKS = [ipaddress.ip_network(n, strict=False)
+                              for n in json.loads(args.allowed_networks)]
 
     _restore_cookies()
 

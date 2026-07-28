@@ -51,8 +51,8 @@
       "allowed_networks": {
         "type": "array",
         "items": { "type": "string" },
-        "default": ["127.0.0.0/8"],
-        "description": "CIDR ranges allowed to use the CONNECT tunnel (the AW Browser container's source IP must be inside one of these)."
+        "default": ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"],
+        "description": "CIDR ranges allowed to use the CONNECT tunnel (the AW Browser container's source IP must be inside one of these). Includes RFC1918 ranges by default because on Tier-2 (podman) deployments aw-app-browser reaches this proxy from the shared podman network, not loopback — port 9124 is never published to the host, so this only ever admits containers already on that private network."
       }
     },
     "required": []
