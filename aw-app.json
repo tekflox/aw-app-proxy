@@ -1,0 +1,66 @@
+{
+  "manifest_version": 1,
+  "id": "proxy",
+  "name": "AW Proxy",
+  "version": "0.1.0",
+  "description": "Browser cookie proxy: an HTTP CONNECT proxy the AW Browser tunnels through, plus the cookie-sync API (/sync-cookies, /clear-cookies) that the aw-sync browser extensions (Chrome + iOS/Safari) push the user's real-browser cookies through, and encrypted persistence of chosen cookies in Postgres so they survive a proxy restart. aw-app-browser depends on this app for authentication.",
+  "tier": "inprocess",
+  "publisher": "TekFlox",
+  "resource_estimate": { "cpu": "low", "memory": "~20 MB", "disk": "~5 MB" },
+
+  "runtime": {
+    "python": ">=3.11",
+    "entrypoint": "proxy_app.plugin:ProxyAppPlugin",
+    "pip_requires": []
+  },
+
+  "permissions": [
+    "service:manage",
+    "routes:register",
+    "secrets:own",
+    "fs:workspace-data",
+    "net:outbound",
+    "db:own-tables"
+  ],
+
+  "contributes": {
+    "routes": [{ "prefix": "/api/apps/proxy" }],
+    "services": [{ "id": "proxy-server", "autostart": true }],
+    "windows": [
+      { "id": "proxy.main", "title": "AW Proxy",
+        "body": { "type": "declarative", "spec": "windows/main.json" } }
+    ],
+    "settings_panels": [
+      { "id": "proxy.settings", "window": "proxy.main" }
+    ]
+  },
+
+  "config_schema": {
+    "type": "object",
+    "properties": {
+      "proxy_port": {
+        "type": "number",
+        "default": 9124,
+        "description": "TCP port the CONNECT-tunnel / cookie-sync HTTP server listens on. The aw-app-browser container's Chrome must be configured to tunnel through host:this-port."
+      },
+      "browser_cdp_list_url": {
+        "type": "string",
+        "default": "http://127.0.0.1:9223/json/list",
+        "description": "CDP /json/list endpoint of the browser this proxy injects/clears cookies into via WebSocket CDP commands. INTEGRATION TBD: this default mirrors the old hard-coded tools/browser/ container-Chrome port; it has not yet been reconciled with aw-app-browser's new Tier-2 (podman container, CDP behind the /api/apps/browser/* reverse proxy) — see this app's README."
+      },
+      "allowed_networks": {
+        "type": "array",
+        "items": { "type": "string" },
+        "default": ["127.0.0.0/8"],
+        "description": "CIDR ranges allowed to use the CONNECT tunnel (the AW Browser container's source IP must be inside one of these)."
+      }
+    },
+    "required": []
+  },
+
+  "dependencies": {
+    "note": "Declared here for documentation — the runtime does not yet resolve/enforce app dependencies (no such mechanism exists in src/apps/ as of 2026-07-28). aw-app-browser declares the reverse edge in its own aw-app.json.dependencies.apps."
+  },
+
+  "migrations": {}
+}

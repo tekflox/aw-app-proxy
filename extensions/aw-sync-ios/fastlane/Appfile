@@ -1,0 +1,3 @@
+app_identifier("com.tekflox.awmetaglasses")
+apple_id("fredericowu@gmail.com")
+team_id(ENV["APPLE_TEAM_ID"])

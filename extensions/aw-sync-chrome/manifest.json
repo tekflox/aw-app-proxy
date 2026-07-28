@@ -1,0 +1,19 @@
+{
+  "manifest_version": 3,
+  "name": "AW Sync Extension",
+  "version": "1.0",
+  "description": "Sync browser cookies to AW container Chrome via CDP",
+  "permissions": ["cookies", "storage"],
+  "host_permissions": ["<all_urls>"],
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icon16.png",
+      "48": "icon48.png"
+    }
+  },
+  "icons": {
+    "16": "icon16.png",
+    "48": "icon48.png"
+  }
+}

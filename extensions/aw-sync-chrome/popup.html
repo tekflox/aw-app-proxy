@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html>
+<head>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { width: 320px; padding: 16px; font-family: -apple-system, system-ui, sans-serif; background: #0f172a; color: #e2e8f0; }
+  h1 { font-size: 14px; font-weight: 700; color: #38bdf8; margin-bottom: 12px; display: flex; align-items: center; gap: 6px; }
+  .status { font-size: 12px; color: #94a3b8; margin-bottom: 12px; min-height: 16px; }
+  .status.error { color: #f87171; }
+  .status.success { color: #4ade80; }
+  button { width: 100%; padding: 10px; border: none; border-radius: 8px; font-size: 13px; font-weight: 600; cursor: pointer; margin-bottom: 8px; }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  .btn-primary { background: #3b82f6; color: white; }
+  .btn-primary:hover:not(:disabled) { background: #2563eb; }
+  .btn-secondary { background: #1e293b; color: #94a3b8; border: 1px solid #334155; }
+  .btn-secondary:hover:not(:disabled) { background: #334155; color: #e2e8f0; }
+  .btn-danger { background: #1e293b; color: #fca5a5; border: 1px solid #7f1d1d; }
+  .btn-danger:hover:not(:disabled) { background: #7f1d1d; color: #fee2e2; }
+  .btn-row { display: flex; gap: 6px; margin-bottom: 8px; }
+  .btn-row button { margin-bottom: 0; flex: 1; padding: 8px; font-size: 11px; font-weight: 500; }
+  .config { margin-bottom: 12px; }
+  .config label { font-size: 11px; color: #64748b; display: block; margin-bottom: 4px; text-transform: uppercase; letter-spacing: 0.04em; }
+  .config-row { display: flex; gap: 6px; align-items: stretch; }
+  .config input {
+    flex: 1;
+    height: 32px;
+    padding: 0 10px;
+    border: 1px solid #334155;
+    border-radius: 6px;
+    background: #1e293b;
+    color: #e2e8f0;
+    font-size: 12px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  .config input:focus { outline: none; border-color: #38bdf8; }
+  .config .reset {
+    /* Reset is a sibling of input — match its 32px height exactly so the
+       row reads as one strip. Override the global button rule's
+       padding:10px / margin-bottom:8px / font-weight:600 / radius:8px so
+       the button doesn't tower over the input. */
+    width: auto;
+    height: 32px;
+    padding: 0 10px;
+    margin: 0;
+    background: #1e293b;
+    color: #94a3b8;
+    border: 1px solid #334155;
+    border-radius: 6px;
+    font-size: 11px;
+    font-weight: 500;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .config .reset:hover { background: #334155; color: #e2e8f0; }
+  .config .hint { font-size: 10px; color: #475569; margin-top: 4px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; word-break: break-all; }
+  .stats { font-size: 11px; color: #64748b; margin-top: 8px; }
+  .domain-list { font-size: 11px; color: #94a3b8; max-height: 120px; overflow-y: auto; margin-top: 8px; background: #1e293b; border-radius: 6px; padding: 8px; }
+  .domain-row { display: flex; justify-content: space-between; padding: 2px 0; }
+  .domain-row .count { color: #64748b; }
+</style>
+</head>
+<body>
+  <h1>AW Cookie Sync</h1>
+
+  <div class="config">
+    <label for="host">Sync host</label>
+    <div class="config-row">
+      <input id="host" type="text" spellcheck="false" autocomplete="off" placeholder="dev.tekflox.com" />
+      <button id="reset-host" class="reset" type="button" title="Reset to default">Reset</button>
+    </div>
+    <div id="host-hint" class="hint"></div>
+  </div>
+
+  <div id="status" class="status">Ready</div>
+
+  <button id="sync-current" class="btn-primary">Sync Current Tab Cookies</button>
+
+  <div class="btn-row">
+    <button id="clear-current" class="btn-danger" type="button" title="Remove cookies for the current tab's domain on the server">Clear Current Tab</button>
+    <button id="clear-all" class="btn-danger" type="button" title="Remove every cookie on the server">Clear All</button>
+  </div>
+
+  <div id="stats" class="stats"></div>
+  <div id="domains" class="domain-list" style="display:none"></div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

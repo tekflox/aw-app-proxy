@@ -1,0 +1,84 @@
+default_platform(:ios)
+
+APP_ID      = "com.tekflox.awmetaglasses"
+EXT_ID      = "com.tekflox.awmetaglasses.Extension"
+PROJECT     = "AW Sync/AW Sync.xcodeproj"
+SCHEME      = "AW Sync (iOS)"
+
+platform :ios do
+  desc "Build and upload AW Sync Safari Extension to TestFlight"
+  lane :beta do
+    setup_ci
+
+    api_key = app_store_connect_api_key(
+      key_id:       ENV["ASC_KEY_ID"],
+      issuer_id:    ENV["ASC_ISSUER_ID"],
+      key_filepath: ENV["ASC_KEY_PATH"],
+      in_house:     false
+    )
+
+    match(
+      type:           "appstore",
+      app_identifier: [APP_ID, EXT_ID],
+      api_key:        api_key,
+      git_url:        ENV["MATCH_GIT_URL"],
+      storage_mode:   "git",
+      readonly:       false,
+      force:          true
+    )
+
+    app_profile = ENV["sigh_#{APP_ID}_appstore_profile-name"]
+    ext_profile = ENV["sigh_#{EXT_ID}_appstore_profile-name"]
+
+    update_code_signing_settings(
+      use_automatic_signing: false,
+      path:                  PROJECT,
+      team_id:               ENV["APPLE_TEAM_ID"],
+      targets:               ["AW Sync (iOS)"],
+      bundle_identifier:     APP_ID,
+      code_sign_identity:    "Apple Distribution",
+      profile_name:          app_profile
+    )
+
+    update_code_signing_settings(
+      use_automatic_signing: false,
+      path:                  PROJECT,
+      team_id:               ENV["APPLE_TEAM_ID"],
+      targets:               ["AW Sync Extension (iOS)"],
+      bundle_identifier:     EXT_ID,
+      code_sign_identity:    "Apple Distribution",
+      profile_name:          ext_profile
+    )
+
+    build_number = ENV["GITHUB_RUN_NUMBER"] || Time.now.to_i.to_s
+
+    build_app(
+      project:          PROJECT,
+      scheme:           SCHEME,
+      export_method:    "app-store",
+      clean:            true,
+      output_directory: "build",
+      xcargs:           "CURRENT_PROJECT_VERSION=#{build_number} IPHONEOS_DEPLOYMENT_TARGET=26.0",
+      export_options: {
+        signingStyle: "manual",
+        provisioningProfiles: {
+          APP_ID => app_profile,
+          EXT_ID => ext_profile
+        }
+      }
+    )
+
+    # Auto-assign the build to the internal tester groups so it lands on the
+    # device without manually adding the group in App Store Connect each build.
+    # Override via TESTFLIGHT_GROUPS="Group A,Group B" if the group names change.
+    tester_groups = (ENV["TESTFLIGHT_GROUPS"] || "App Store Connect Users,Internal Testers")
+                      .split(",").map(&:strip).reject(&:empty?)
+
+    upload_to_testflight(
+      api_key:                          api_key,
+      distribute_external:              false,
+      groups:                           tester_groups,
+      wait_processing_timeout_duration: 1800
+    )
+  end
+end

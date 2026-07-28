@@ -1,0 +1,93 @@
+{
+  "layout": "stack",
+  "regions": [
+    {
+      "id": "status",
+      "widgets": [
+        { "type": "markdown", "value": "## AW Proxy\nCookie proxy for the AW Browser — the CONNECT-tunnel/cookie-sync service and its persisted cookies." },
+        {
+          "type": "auth_status",
+          "bind": "GET /api/apps/proxy/status",
+          "loading_text": "Checking proxy service…",
+          "logged_in_text": "Service running (pid {pid})"
+        }
+      ]
+    },
+    {
+      "id": "persisted-cookies",
+      "widgets": [
+        { "type": "markdown", "value": "### Persisted cookies\nCookies marked here survive a proxy restart — re-injected into the browser on startup." },
+        {
+          "type": "table",
+          "bind": "GET /api/apps/proxy/cookie-keys",
+          "items_field": "keys",
+          "columns": [
+            { "field": "name", "label": "Name" },
+            { "field": "domain", "label": "Domain" },
+            { "field": "persisted", "label": "Persisted" }
+          ],
+          "row_actions": [
+            {
+              "label": "Persist",
+              "visible_when": { "field": "persisted", "equals": false },
+              "action": { "call": "POST /api/apps/proxy/persistent-cookies/{name}" }
+            },
+            {
+              "label": "Forget",
+              "visible_when": { "field": "persisted", "equals": true },
+              "action": { "call": "DELETE /api/apps/proxy/persistent-cookies/{name}" }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "extensions",
+      "widgets": [
+        { "type": "markdown", "value": "### Sync your browser's cookies in\nInstall the aw-sync extension in your real browser to push its cookies into this proxy." },
+        {
+          "type": "button",
+          "label": "Download Chrome extension (.zip)",
+          "action": { "open": "/api/apps/proxy/extensions/chrome.zip" }
+        },
+        {
+          "type": "button",
+          "label": "iOS / Safari setup instructions",
+          "action": { "open": "/api/apps/proxy/extensions/ios-readme" }
+        }
+      ]
+    },
+    {
+      "id": "advanced",
+      "widgets": [
+        {
+          "type": "collapsible",
+          "title": "Advanced",
+          "collapsed": true,
+          "widgets": [
+            {
+              "type": "form",
+              "id": "advanced_settings",
+              "submit_label": "Save",
+              "fields": [
+                {
+                  "key": "proxy_port",
+                  "label": "Proxy port",
+                  "input": "number",
+                  "default": 9124
+                },
+                {
+                  "key": "browser_cdp_list_url",
+                  "label": "Browser CDP /json/list URL",
+                  "input": "text",
+                  "placeholder": "http://127.0.0.1:9223/json/list",
+                  "description": "Not yet reconciled with aw-app-browser's Tier-2 container — see this app's README."
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
