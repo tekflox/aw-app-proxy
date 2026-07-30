@@ -59,7 +59,7 @@
   },
 
   "dependencies": {
-    "note": "Declared here for documentation — the runtime does not yet resolve/enforce app dependencies (no such mechanism exists in src/apps/ as of 2026-07-28). aw-app-browser declares the reverse edge in its own aw-app.json.dependencies.apps."
+    "note": "No required app dependencies. aw-app-browser declares proxy as a required dependency; aw-workspace now enforces that edge at install/reconcile time."
   },
 
   "migrations": {}
