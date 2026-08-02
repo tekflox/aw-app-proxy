@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import io
 import os
+import re
 import zipfile
 
 from fastapi import Body, FastAPI
@@ -31,6 +32,30 @@ from .crypto import decrypt, encrypt
 _PACKAGE_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _EXT_CHROME_DIR = os.path.join(_PACKAGE_ROOT, "extensions", "aw-sync-chrome")
 _EXT_IOS_README = os.path.join(_PACKAGE_ROOT, "extensions", "aw-sync-ios", "README.md")
+
+
+def _workspace_api_host() -> str:
+    """This workspace's own public API domain (F4 three-plane split — the
+    SPA is at ``<slug>.workspace.aw.tekflox.com``, its API at
+    ``api.<slug>.workspace.aw.tekflox.com``). Decoupled here instead of
+    hand-typed into the extension by every user (Frederico's ask,
+    2026-08-02) — AW_WORKSPACE is set on every aw-workspace process."""
+    slug = os.environ.get("AW_WORKSPACE", "").strip()
+    return f"api.{slug}.workspace.aw.tekflox.com" if slug else "aw.tekflox.com"
+
+
+def _patch_default_host(popup_js_path: str) -> str:
+    """Bake this workspace's real API host into the extension's
+    DEFAULT_HOST constant so it works out of the box with zero manual
+    configuration — same source file served to every workspace, only the
+    baked-in default differs per download."""
+    src = open(popup_js_path, encoding="utf-8").read()
+    return re.sub(
+        r'const DEFAULT_HOST = "[^"]*";',
+        f'const DEFAULT_HOST = "{_workspace_api_host()}";',
+        src,
+        count=1,
+    )
 
 
 def _cdp_list_url(ctx) -> str:
@@ -232,7 +257,11 @@ def build_app(ctx) -> FastAPI:
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
             for fname in os.listdir(_EXT_CHROME_DIR):
                 fpath = os.path.join(_EXT_CHROME_DIR, fname)
-                if os.path.isfile(fpath):
+                if not os.path.isfile(fpath):
+                    continue
+                if fname == "popup.js":
+                    zf.writestr(fname, _patch_default_host(fpath))
+                else:
                     zf.write(fpath, arcname=fname)
         buf.seek(0)
         return StreamingResponse(
