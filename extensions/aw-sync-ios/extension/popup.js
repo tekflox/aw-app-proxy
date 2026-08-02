@@ -46,9 +46,31 @@ function setStatus(msg, type = "") {
 
 // ── URL building ──────────────────────────────────────────────────────────────
 
-function buildEndpointUrl(rawHost, endpoint) {
+function hostnameOf(rawHost) {
   const host = (rawHost || "").trim();
-  const path = endpoint.startsWith("/") ? endpoint : `/${endpoint}`;
+  if (!host) return DEFAULT_HOST;
+  if (/^https?:\/\//i.test(host)) {
+    try { return new URL(host).hostname; } catch (_) { return host; }
+  }
+  return host.split(":")[0].split("/")[0];
+}
+
+// Per-app subdomains (<app-slug>.app.<ws-slug>.workspace...) are Host()-routed
+// straight to the app's sub-application with NO path prefix stripped (see
+// aw-workspace's src/apps/runtime.py _attach_mount: Host(f"{app_id}.app.{{_}}")
+// dispatches "/sync-cookies" as-is). The workspace-wide API host
+// (api.<ws>.workspace...) mounts the same app under /api/apps/proxy instead
+// (Mount(f"/api/apps/{app_id}")). Same backend view, two different URL shapes
+// — pick the right one based on which host pattern is configured, instead of
+// hardcoding the path-prefixed shape and silently 404ing on the subdomain.
+function isAppSubdomain(rawHost) {
+  return /\.app\./i.test(hostnameOf(rawHost));
+}
+
+function buildEndpointUrl(rawHost, name) {
+  const host = (rawHost || "").trim();
+  const bare = name.startsWith("/") ? name : `/${name}`;
+  const path = isAppSubdomain(host) ? bare : `/api/apps/proxy${bare}`;
   if (!host) return `https://${DEFAULT_HOST}${path}`;
 
   // Full URL with scheme — honor it. Strip a trailing slash, then append path.
@@ -64,8 +86,8 @@ function buildEndpointUrl(rawHost, endpoint) {
   return `${scheme}://${host}${path}`;
 }
 
-function buildProxyUrl(rawHost) { return buildEndpointUrl(rawHost, "/api/apps/proxy/sync-cookies"); }
-function buildClearUrl(rawHost) { return buildEndpointUrl(rawHost, "/api/apps/proxy/clear-cookies"); }
+function buildProxyUrl(rawHost) { return buildEndpointUrl(rawHost, "/sync-cookies"); }
+function buildClearUrl(rawHost) { return buildEndpointUrl(rawHost, "/clear-cookies"); }
 
 function updateHint() {
   hostHint.textContent = `→ ${buildProxyUrl(hostInput.value)}`;
@@ -206,7 +228,21 @@ async function authedPost(url, body) {
   });
   if (resp.status === 401) throw new NotLoggedInError(hostInput.value || DEFAULT_HOST);
 
-  const result = await resp.json().catch(() => ({}));
+  // Don't silently swallow non-2xx / non-JSON responses into {} — that made
+  // real failures (404 from a wrong route, 502 upstream, HTML error page,
+  // etc.) render as "0 synced, 0 failed" with no clue why. Surface the raw
+  // status + body so the user (and the "Error: ..." status line) can see
+  // what actually happened.
+  const rawBody = await resp.text();
+  let result;
+  try {
+    result = rawBody ? JSON.parse(rawBody) : {};
+  } catch (_) {
+    throw new Error(`HTTP ${resp.status} ${resp.statusText}: ${rawBody.slice(0, 200) || "(empty/non-JSON response)"}`);
+  }
+  if (!resp.ok) {
+    throw new Error(result.message || result.error || `HTTP ${resp.status} ${resp.statusText}`);
+  }
   if (result.error) throw new Error(result.message || result.error);
   return result;
 }
