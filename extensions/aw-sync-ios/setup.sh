@@ -33,7 +33,7 @@ fi
 
 # ── Copy icons from Chrome extension ─────────────────────────────────────────
 
-CHROME_EXT="$SCRIPT_DIR/../aw-sync-extension-chrome"
+CHROME_EXT="$SCRIPT_DIR/../aw-sync-chrome"
 IMAGES_DIR="$EXTENSION_DIR/images"
 
 echo "▶ Copying icons from Chrome extension…"
