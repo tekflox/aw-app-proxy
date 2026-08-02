@@ -41,11 +41,11 @@ function buildEndpointUrl(rawHost, endpoint) {
 }
 
 function buildProxyUrl(rawHost) {
-  return buildEndpointUrl(rawHost, "/sync-cookies");
+  return buildEndpointUrl(rawHost, "/api/apps/proxy/sync-cookies");
 }
 
 function buildClearUrl(rawHost) {
-  return buildEndpointUrl(rawHost, "/clear-cookies");
+  return buildEndpointUrl(rawHost, "/api/apps/proxy/clear-cookies");
 }
 
 function updateHint() {
@@ -158,7 +158,7 @@ async function authedPost(url, body) {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "X-AW-JWT": token,
+      "Authorization": `Bearer ${token}`,
     },
     body: JSON.stringify(body),
   });

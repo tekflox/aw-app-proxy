@@ -48,9 +48,12 @@ class ProxyAppPlugin:
 
         port = int(ctx.config.get("proxy_port") or 9124)
         allowed_networks = resolve_allowed_networks(ctx.config)
+        from .cdp import cdp_list_url_default
+        cdp_list_url = ctx.config.get("browser_cdp_list_url") or cdp_list_url_default()
         start_cmd = (
             f"{sys.executable} -m proxy_app.proxy_server --port {port} "
-            f"--allowed-networks {shlex.quote(json.dumps(allowed_networks))}"
+            f"--allowed-networks {shlex.quote(json.dumps(allowed_networks))} "
+            f"--cdp-list-url {shlex.quote(cdp_list_url)}"
         )
         ctx.services.register(SERVICE_ID, start_cmd, autostart=True)
 

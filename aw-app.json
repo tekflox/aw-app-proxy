@@ -1,7 +1,7 @@
 {
   "manifest_version": 1,
   "id": "proxy",
-  "name": "AW Proxy",
+  "name": "Proxy",
   "version": "0.1.0",
   "description": "Browser cookie proxy: an HTTP CONNECT proxy the AW Browser tunnels through, plus the cookie-sync API (/sync-cookies, /clear-cookies) that the aw-sync browser extensions (Chrome + iOS/Safari) push the user's real-browser cookies through, and encrypted persistence of chosen cookies in Postgres so they survive a proxy restart. aw-app-browser depends on this app for authentication.",
   "tier": "inprocess",
@@ -28,9 +28,9 @@
     "routes": [{ "prefix": "/api/apps/proxy" }],
     "services": [{ "id": "proxy-server", "autostart": true }],
     "windows": [
-      { "id": "proxy.logs", "title": "AW Proxy",
+      { "id": "proxy.logs", "title": "Proxy",
         "body": { "type": "managed_app", "component": "service:proxy:proxy-server" } },
-      { "id": "proxy.main", "title": "AW Proxy",
+      { "id": "proxy.main", "title": "Proxy",
         "body": { "type": "declarative", "spec": "windows/main.json" } }
     ],
     "settings_panels": [
@@ -48,8 +48,8 @@
       },
       "browser_cdp_list_url": {
         "type": "string",
-        "default": "http://127.0.0.1:9223/json/list",
-        "description": "CDP /json/list endpoint of the browser this proxy injects/clears cookies into via WebSocket CDP commands. INTEGRATION TBD: this default mirrors the old hard-coded tools/browser/ container-Chrome port; it has not yet been reconciled with aw-app-browser's new Tier-2 (podman container, CDP behind the /api/apps/browser/* reverse proxy) — see this app's README."
+        "default": "http://aw-app-browser:9223/json/list",
+        "description": "CDP /json/list endpoint of the browser this proxy injects/clears cookies into via WebSocket CDP commands. aw-app-browser is a separate Tier-2 (podman) container reachable by its own name on the shared workspace network — override only if your workspace runs the browser under a different app id/network."
       },
       "allowed_networks": {
         "type": "array",

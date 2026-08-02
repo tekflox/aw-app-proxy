@@ -16,7 +16,11 @@ from urllib.parse import urlparse
 
 
 def cdp_list_url_default() -> str:
-    return "http://127.0.0.1:9223/json/list"
+    # aw-app-browser is a separate Tier-2 (podman) container reachable by
+    # its own name on the shared workspace network — 127.0.0.1 here would
+    # only ever be this app's own loopback, not the browser's (reconciled
+    # 2026-08-02; see aw-app-browser's aw-app.json dependency note).
+    return "http://aw-app-browser:9223/json/list"
 
 
 def cdp_ws_url(list_url: str, timeout: float = 3.0) -> str | None:

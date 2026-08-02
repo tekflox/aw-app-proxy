@@ -64,8 +64,8 @@ function buildEndpointUrl(rawHost, endpoint) {
   return `${scheme}://${host}${path}`;
 }
 
-function buildProxyUrl(rawHost) { return buildEndpointUrl(rawHost, "/sync-cookies"); }
-function buildClearUrl(rawHost) { return buildEndpointUrl(rawHost, "/clear-cookies"); }
+function buildProxyUrl(rawHost) { return buildEndpointUrl(rawHost, "/api/apps/proxy/sync-cookies"); }
+function buildClearUrl(rawHost) { return buildEndpointUrl(rawHost, "/api/apps/proxy/clear-cookies"); }
 
 function updateHint() {
   hostHint.textContent = `→ ${buildProxyUrl(hostInput.value)}`;
@@ -200,7 +200,7 @@ async function authedPost(url, body) {
     method:  "POST",
     headers: {
       "Content-Type": "application/json",
-      "X-AW-JWT":     token,
+      "Authorization": `Bearer ${token}`,
     },
     body: JSON.stringify(body),
   });

@@ -128,6 +128,72 @@ def build_app(ctx) -> FastAPI:
             cookies.append(entry)
         return {"cookies": cookies, "protected_names": protected_names}
 
+    @app.post("/sync-cookies")
+    async def sync_cookies(body: dict = Body(default={})):
+        """Receive cookies exported by the aw-sync browser extension and
+        inject them into the workspace's own Chrome via CDP Network.setCookie
+        (ported from proxy_server.py's bespoke /sync-cookies handler — that
+        one is unreachable from outside the workspace, since it's a raw
+        socket server on an internal-only port; this route rides the same
+        /api/apps/proxy mount the rest of the app already exposes publicly,
+        auth handled by the framework's IdentityGuard instead of a
+        hand-rolled JWT check)."""
+        cookies = body.get("cookies") or []
+        if not cookies:
+            return JSONResponse({"error": "No cookies"}, status_code=400)
+
+        ws_url = cdp.cdp_ws_url(_cdp_list_url(ctx))
+        if not ws_url:
+            return JSONResponse({"error": "CDP not reachable — is the browser running?"}, status_code=502)
+
+        sock = cdp.open_ws(ws_url)
+        injected, failed = 0, 0
+        injected_cookies = []
+        for msg_id, cookie in enumerate(cookies, start=1):
+            name = cookie.get("name", "")
+            is_host_prefix = name.startswith("__Host-")
+            is_secure_prefix = name.startswith("__Secure-")
+            same_site = cookie.get("sameSite", "Lax")
+            secure = bool(cookie.get("secure", False)) or is_host_prefix \
+                or is_secure_prefix or same_site == "None"
+            scheme = "https" if secure else "http"
+            domain = cookie.get("domain", "").lstrip(".")
+            params = {
+                "name": name, "value": cookie.get("value", ""),
+                "path": "/" if is_host_prefix else cookie.get("path", "/"),
+                "secure": secure, "httpOnly": cookie.get("httpOnly", False),
+                "sameSite": same_site, "url": f"{scheme}://{domain}/",
+            }
+            if not is_host_prefix:
+                params["domain"] = cookie.get("domain", "")
+            if cookie.get("expirationDate"):
+                params["expires"] = cookie["expirationDate"]
+            result = cdp.send_recv(sock, msg_id, "Network.setCookie", params)
+            if result and result.get("result", {}).get("success"):
+                injected += 1
+                injected_cookies.append(cookie)
+            else:
+                failed += 1
+        sock.close()
+
+        for cookie in injected_cookies:
+            name = cookie.get("name")
+            if not name:
+                continue
+            store.upsert({
+                "name": name,
+                "value_enc": encrypt(ctx, cookie.get("value", "")),
+                "domain": cookie.get("domain", ""),
+                "path": cookie.get("path", "/"),
+                "secure": bool(cookie.get("secure", False)),
+                "http_only": bool(cookie.get("httpOnly", False)),
+                "same_site": cookie.get("sameSite") or "Lax",
+                "expires": cookie.get("expirationDate") or None,
+            })
+
+        return {"injected": injected, "failed": failed}
+
+    @app.post("/clear-cookies")  # alias the aw-sync extensions POST to
     @app.post("/browser-cookies/clear")
     async def clear_browser_cookies(body: dict = Body(default={})):
         clear_all = bool(body.get("all"))
