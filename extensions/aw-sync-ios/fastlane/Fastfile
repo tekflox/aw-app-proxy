@@ -64,7 +64,7 @@ platform :ios do
       # this project ("AW Sync" instead of "AW Sync (iOS)") — found
       # 2026-08-02 doing the very first build. This project has no Swift
       # Package dependencies to resolve anyway, so just skip the step.
-      skip_package_dependency_resolution: true,
+      skip_package_dependencies_resolution: true,
       xcargs:           "CURRENT_PROJECT_VERSION=#{build_number} IPHONEOS_DEPLOYMENT_TARGET=26.0",
       export_options: {
         signingStyle: "manual",
