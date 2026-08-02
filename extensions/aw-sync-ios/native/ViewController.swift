@@ -84,7 +84,7 @@ class ViewController: UIViewController {
 
     // MARK: - Config
 
-    private let defaultHost = "dev.tekflox.com"
+    private let defaultHost = "proxy.app.aw.workspace.aw.tekflox.com"
     private let storageKey  = "awSyncHost"
 
     // safari-web-extension-converter's generated Main.storyboard binds this outlet
@@ -460,21 +460,25 @@ class ViewController: UIViewController {
             self.debugLog("filtered: \(filtered.count)")
 
             let hostDomain = host.components(separatedBy: ":").first ?? host
+            // aw_id_jwt — the F2 identity system's apex cookie (aw-workspace's
+            // IdentityGuard, what actually gates /sync-cookies) is a different
+            // cookie from the legacy "aw_jwt" this used to read (auth_utils.py's
+            // older, now-bypassed cookie name). Fixed 2026-08-02.
             let awJwt = cookies.first {
-                $0.name == "aw_jwt" &&
+                $0.name == "aw_id_jwt" &&
                 $0.domain.contains(hostDomain.components(separatedBy: ".").suffix(2).joined(separator: "."))
             }?.value
 
             guard let token = awJwt else {
-                self.debugLog("❌ no aw_jwt for \(host)")
+                self.debugLog("❌ no aw_id_jwt for \(host)")
                 self.setStatus(
-                    "⚠️ No aw_jwt cookie found for \(host).\nOpen \(self.originUrl(host)) in Safari and log in first.",
+                    "⚠️ No aw_id_jwt cookie found for \(host).\nOpen \(self.originUrl(host)) in Safari and log in first.",
                     color: .systemOrange
                 )
                 DispatchQueue.main.async { self.syncButton.isEnabled = true }
                 return
             }
-            self.debugLog("aw_jwt ✓ — posting \(filtered.count) cookies")
+            self.debugLog("aw_id_jwt ✓ — posting \(filtered.count) cookies")
             self.setStatus("Found \(filtered.count) cookies. Posting…", color: .secondaryLabel)
 
             let cookieList: [[String: Any]] = filtered.map { c in
@@ -509,7 +513,12 @@ class ViewController: UIViewController {
             var req = URLRequest(url: url, timeoutInterval: 15)
             req.httpMethod = "POST"
             req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            req.setValue(token, forHTTPHeaderField: "X-AW-JWT")
+            // aw-workspace's IdentityGuard only recognizes Authorization: Bearer
+            // or the apex aw_id_jwt cookie — the old X-AW-JWT header was the
+            // bespoke monolith proxy_server.py's own auth check, retired
+            // 2026-08-02 when /sync-cookies moved onto the app framework's
+            // shared identity layer.
+            req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
             req.httpBody = body
 
             URLSession.shared.dataTask(with: req) { [weak self] data, resp, err in

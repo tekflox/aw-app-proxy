@@ -164,7 +164,7 @@ class NotLoggedInError extends Error {
   }
 }
 
-const AW_COOKIE = "aw_jwt";
+const AW_COOKIE = "aw_id_jwt"; // aw-workspace IdentityGuard's apex cookie (F2) — not the legacy "aw_jwt"
 
 function originForHost(rawHost) {
   const host = (rawHost || "").trim();

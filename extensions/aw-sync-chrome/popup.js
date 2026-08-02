@@ -126,7 +126,7 @@ class NotLoggedInError extends Error {
 // AW's auth cookie. SameSite=Lax means a cross-site fetch from this popup
 // won't carry it automatically — so we read the value via chrome.cookies
 // (the extension has the `cookies` permission) and forward it as a header.
-const AW_COOKIE = "aw_jwt";
+const AW_COOKIE = "aw_id_jwt"; // aw-workspace IdentityGuard's apex cookie (F2) — not the legacy "aw_jwt"
 
 function originForHost(rawHost) {
   const host = (rawHost || "").trim();
