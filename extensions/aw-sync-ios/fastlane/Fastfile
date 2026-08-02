@@ -58,6 +58,13 @@ platform :ios do
       export_method:    "app-store",
       clean:            true,
       output_directory: "build",
+      # gym's own pre-build "-resolvePackageDependencies" preflight
+      # (independent of the `scheme:` above) infers its own scheme name
+      # from the project instead of using SCHEME, and gets it wrong for
+      # this project ("AW Sync" instead of "AW Sync (iOS)") — found
+      # 2026-08-02 doing the very first build. This project has no Swift
+      # Package dependencies to resolve anyway, so just skip the step.
+      skip_package_dependency_resolution: true,
       xcargs:           "CURRENT_PROJECT_VERSION=#{build_number} IPHONEOS_DEPLOYMENT_TARGET=26.0",
       export_options: {
         signingStyle: "manual",
