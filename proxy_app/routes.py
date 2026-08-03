@@ -62,9 +62,54 @@ def _cdp_list_url(ctx) -> str:
     return ctx.config.get("browser_cdp_list_url") or cdp.cdp_list_url_default()
 
 
-def build_app(ctx) -> FastAPI:
+def restore_persisted_cookies(ctx, store: CookieStore) -> tuple[int, int]:
+    """Inject every persisted cookie into the live browser via CDP,
+    best-effort. Shared by the periodic reconnect-loop in ``plugin.py``
+    (browser comes back online → catch it up on whatever was persisted
+    while it was down) and available for a manual "restore now" call.
+    Returns ``(injected, failed)``; ``(0, 0)`` if there's nothing to do or
+    CDP isn't reachable right now."""
+    rows = store.all_rows()
+    if not rows:
+        return 0, 0
+    ws_url = cdp.cdp_ws_url(_cdp_list_url(ctx))
+    if not ws_url:
+        return 0, 0
+
+    sock = cdp.open_ws(ws_url)
+    injected, failed = 0, 0
+    try:
+        for msg_id, row in enumerate(rows, start=1):
+            try:
+                value = decrypt(ctx, row["value_enc"])
+            except ValueError:
+                failed += 1
+                continue
+            secure = bool(row["secure"])
+            scheme = "https" if secure else "http"
+            domain = (row["domain"] or "").lstrip(".")
+            params = {
+                "name": row["name"], "value": value,
+                "path": row["path"] or "/", "secure": secure,
+                "httpOnly": bool(row["http_only"]), "sameSite": row["same_site"] or "Lax",
+                "url": f"{scheme}://{domain}/", "domain": row["domain"],
+            }
+            if row["expires"]:
+                params["expires"] = row["expires"]
+            result = cdp.send_recv(sock, msg_id, "Network.setCookie", params)
+            if result and result.get("result", {}).get("success"):
+                injected += 1
+            else:
+                failed += 1
+    finally:
+        sock.close()
+    return injected, failed
+
+
+def build_app(ctx, store: CookieStore | None = None) -> FastAPI:
     app = FastAPI()
-    store = CookieStore(ctx)
+    if store is None:
+        store = CookieStore(ctx)
     store.ensure_table()
 
     @app.get("/status")
@@ -155,53 +200,29 @@ def build_app(ctx) -> FastAPI:
 
     @app.post("/sync-cookies")
     async def sync_cookies(body: dict = Body(default={})):
-        """Receive cookies exported by the aw-sync browser extension and
-        inject them into the workspace's own Chrome via CDP Network.setCookie
-        (ported from proxy_server.py's bespoke /sync-cookies handler — that
-        one is unreachable from outside the workspace, since it's a raw
-        socket server on an internal-only port; this route rides the same
-        /api/apps/proxy mount the rest of the app already exposes publicly,
-        auth handled by the framework's IdentityGuard instead of a
-        hand-rolled JWT check)."""
+        """Receive cookies exported by the aw-sync browser extension.
+
+        Persist-then-inject, decoupled (2026-08-03 design change, Frederico):
+        the browser (aw-app-browser, a separate Tier-2 app) being down used
+        to make the whole sync request 502 and lose the cookies entirely —
+        step 2 (live inject) was a precondition for step 1 (persist). Now:
+
+        1. Persist every incoming cookie to ``cookie_store`` unconditionally
+           — this is the durable source of truth regardless of whether the
+           browser is reachable right now.
+        2. THEN, best-effort, inject live via CDP if the browser happens to
+           be reachable right now, so an already-open session updates
+           immediately.
+
+        If the browser is offline, a later reconnect is handled by the
+        periodic CDP-reachability poll in ``plugin.py``
+        (``restore_persisted_cookies``), not by this endpoint."""
         cookies = body.get("cookies") or []
         if not cookies:
             return JSONResponse({"error": "No cookies"}, status_code=400)
 
-        ws_url = cdp.cdp_ws_url(_cdp_list_url(ctx))
-        if not ws_url:
-            return JSONResponse({"error": "CDP not reachable — is the browser running?"}, status_code=502)
-
-        sock = cdp.open_ws(ws_url)
-        injected, failed = 0, 0
-        injected_cookies = []
-        for msg_id, cookie in enumerate(cookies, start=1):
-            name = cookie.get("name", "")
-            is_host_prefix = name.startswith("__Host-")
-            is_secure_prefix = name.startswith("__Secure-")
-            same_site = cookie.get("sameSite", "Lax")
-            secure = bool(cookie.get("secure", False)) or is_host_prefix \
-                or is_secure_prefix or same_site == "None"
-            scheme = "https" if secure else "http"
-            domain = cookie.get("domain", "").lstrip(".")
-            params = {
-                "name": name, "value": cookie.get("value", ""),
-                "path": "/" if is_host_prefix else cookie.get("path", "/"),
-                "secure": secure, "httpOnly": cookie.get("httpOnly", False),
-                "sameSite": same_site, "url": f"{scheme}://{domain}/",
-            }
-            if not is_host_prefix:
-                params["domain"] = cookie.get("domain", "")
-            if cookie.get("expirationDate"):
-                params["expires"] = cookie["expirationDate"]
-            result = cdp.send_recv(sock, msg_id, "Network.setCookie", params)
-            if result and result.get("result", {}).get("success"):
-                injected += 1
-                injected_cookies.append(cookie)
-            else:
-                failed += 1
-        sock.close()
-
-        for cookie in injected_cookies:
+        persisted = 0
+        for cookie in cookies:
             name = cookie.get("name")
             if not name:
                 continue
@@ -215,8 +236,45 @@ def build_app(ctx) -> FastAPI:
                 "same_site": cookie.get("sameSite") or "Lax",
                 "expires": cookie.get("expirationDate") or None,
             })
+            persisted += 1
 
-        return {"injected": injected, "failed": failed}
+        ws_url = cdp.cdp_ws_url(_cdp_list_url(ctx))
+        if not ws_url:
+            return {"persisted": persisted, "injected": 0, "failed": 0,
+                    "browser_reachable": False}
+
+        sock = cdp.open_ws(ws_url)
+        injected, failed = 0, 0
+        try:
+            for msg_id, cookie in enumerate(cookies, start=1):
+                name = cookie.get("name", "")
+                is_host_prefix = name.startswith("__Host-")
+                is_secure_prefix = name.startswith("__Secure-")
+                same_site = cookie.get("sameSite", "Lax")
+                secure = bool(cookie.get("secure", False)) or is_host_prefix \
+                    or is_secure_prefix or same_site == "None"
+                scheme = "https" if secure else "http"
+                domain = cookie.get("domain", "").lstrip(".")
+                params = {
+                    "name": name, "value": cookie.get("value", ""),
+                    "path": "/" if is_host_prefix else cookie.get("path", "/"),
+                    "secure": secure, "httpOnly": cookie.get("httpOnly", False),
+                    "sameSite": same_site, "url": f"{scheme}://{domain}/",
+                }
+                if not is_host_prefix:
+                    params["domain"] = cookie.get("domain", "")
+                if cookie.get("expirationDate"):
+                    params["expires"] = cookie["expirationDate"]
+                result = cdp.send_recv(sock, msg_id, "Network.setCookie", params)
+                if result and result.get("result", {}).get("success"):
+                    injected += 1
+                else:
+                    failed += 1
+        finally:
+            sock.close()
+
+        return {"persisted": persisted, "injected": injected, "failed": failed,
+                "browser_reachable": True}
 
     @app.post("/clear-cookies")  # alias the aw-sync extensions POST to
     @app.post("/browser-cookies/clear")
