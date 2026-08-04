@@ -65,6 +65,11 @@
   "config_schema": {
     "type": "object",
     "properties": {
+      "auto_start": {
+        "type": "boolean",
+        "default": true,
+        "description": "Start the proxy-server service automatically when the workspace starts."
+      },
       "proxy_port": {
         "type": "number",
         "default": 9124,

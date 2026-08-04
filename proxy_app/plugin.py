@@ -65,7 +65,7 @@ class ProxyAppPlugin:
             f"--allowed-networks {shlex.quote(json.dumps(allowed_networks))} "
             f"--cdp-list-url {shlex.quote(cdp_list_url)}"
         )
-        ctx.services.register(SERVICE_ID, start_cmd, autostart=True)
+        ctx.services.register(SERVICE_ID, start_cmd, autostart=ctx.config.get("auto_start", True))
 
         self._reconnect_task = asyncio.create_task(self._cookie_reconnect_loop())
 
