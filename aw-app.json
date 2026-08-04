@@ -2,19 +2,21 @@
   "manifest_version": 1,
   "id": "proxy",
   "name": "Proxy",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Browser cookie proxy: an HTTP CONNECT proxy the AW Browser tunnels through, plus the cookie-sync API (/sync-cookies, /clear-cookies) that the aw-sync browser extensions (Chrome + iOS/Safari) push the user's real-browser cookies through, and encrypted persistence of chosen cookies in Postgres so they survive a proxy restart. aw-app-browser depends on this app for authentication.",
   "tier": "inprocess",
   "category": "Service",
   "publisher": "TekFlox",
-  "resource_estimate": { "cpu": "low", "memory": "~20 MB", "disk": "~5 MB" },
-
+  "resource_estimate": {
+    "cpu": "low",
+    "memory": "~20 MB",
+    "disk": "~5 MB"
+  },
   "runtime": {
     "python": ">=3.11",
     "entrypoint": "proxy_app.plugin:ProxyAppPlugin",
     "pip_requires": []
   },
-
   "permissions": [
     "service:manage",
     "routes:register",
@@ -23,21 +25,43 @@
     "net:outbound",
     "db:own-tables"
   ],
-
   "contributes": {
-    "routes": [{ "prefix": "/api/apps/proxy" }],
-    "services": [{ "id": "proxy-server", "autostart": true }],
+    "routes": [
+      {
+        "prefix": "/api/apps/proxy"
+      }
+    ],
+    "services": [
+      {
+        "id": "proxy-server",
+        "autostart": true
+      }
+    ],
     "windows": [
-      { "id": "proxy.logs", "title": "Proxy",
-        "body": { "type": "managed_app", "component": "service:proxy:proxy-server" } },
-      { "id": "proxy.main", "title": "Proxy",
-        "body": { "type": "declarative", "spec": "windows/main.json" } }
+      {
+        "id": "proxy.logs",
+        "title": "Proxy",
+        "body": {
+          "type": "managed_app",
+          "component": "service:proxy:proxy-server"
+        }
+      },
+      {
+        "id": "proxy.main",
+        "title": "Proxy",
+        "body": {
+          "type": "declarative",
+          "spec": "windows/main.json"
+        }
+      }
     ],
     "settings_panels": [
-      { "id": "proxy.settings", "window": "proxy.main" }
+      {
+        "id": "proxy.settings",
+        "window": "proxy.main"
+      }
     ]
   },
-
   "config_schema": {
     "type": "object",
     "properties": {
@@ -49,21 +73,26 @@
       "browser_cdp_list_url": {
         "type": "string",
         "default": "http://aw-app-browser:9223/json/list",
-        "description": "CDP /json/list endpoint of the browser this proxy injects/clears cookies into via WebSocket CDP commands. aw-app-browser is a separate Tier-2 (podman) container reachable by its own name on the shared workspace network — override only if your workspace runs the browser under a different app id/network."
+        "description": "CDP /json/list endpoint of the browser this proxy injects/clears cookies into via WebSocket CDP commands. aw-app-browser is a separate Tier-2 (podman) container reachable by its own name on the shared workspace network \u2014 override only if your workspace runs the browser under a different app id/network."
       },
       "allowed_networks": {
         "type": "array",
-        "items": { "type": "string" },
-        "default": ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"],
-        "description": "CIDR ranges allowed to use the CONNECT tunnel (the AW Browser container's source IP must be inside one of these). Includes RFC1918 ranges by default because on Tier-2 (podman) deployments aw-app-browser reaches this proxy from the shared podman network, not loopback — port 9124 is never published to the host, so this only ever admits containers already on that private network."
+        "items": {
+          "type": "string"
+        },
+        "default": [
+          "127.0.0.0/8",
+          "10.0.0.0/8",
+          "172.16.0.0/12",
+          "192.168.0.0/16"
+        ],
+        "description": "CIDR ranges allowed to use the CONNECT tunnel (the AW Browser container's source IP must be inside one of these). Includes RFC1918 ranges by default because on Tier-2 (podman) deployments aw-app-browser reaches this proxy from the shared podman network, not loopback \u2014 port 9124 is never published to the host, so this only ever admits containers already on that private network."
       }
     },
     "required": []
   },
-
   "dependencies": {
     "note": "No required app dependencies. aw-app-browser declares proxy as a required dependency; aw-workspace now enforces that edge at install/reconcile time."
   },
-
   "migrations": {}
 }
