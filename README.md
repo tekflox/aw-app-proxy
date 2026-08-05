@@ -1,58 +1,23 @@
-# aw-app-proxy
+# Proxy
 
-Workspace app that provides authenticated browsing support for AW Browser.
-It includes the CONNECT proxy, encrypted cookie persistence, and browser
-extensions used to sync cookies into the workspace.
+Proxy provides authenticated browsing support for Browser in an AW Workspace. It gives the workspace a private browser proxy and a cookie-sync service so the workspace browser can access sites the user is already signed into.
 
-## Features
+## What It Does
 
-- HTTP CONNECT proxy for browser traffic.
-- `/sync-cookies` and `/clear-cookies` endpoints for cookie injection and
-  cleanup.
-- CDP helpers for `Network.setCookie`, `Network.getAllCookies`,
-  `Network.clearBrowserCookies`, and `Network.deleteCookies`.
-- Persistent encrypted cookie storage.
-- Chrome and Safari Web Extension sources under `extensions/`.
+- Runs a private HTTP CONNECT proxy for the workspace browser.
+- Receives selected cookies from supported browser extensions.
+- Stores chosen cookies securely so browser access survives restarts.
+- Injects or clears cookies in the workspace browser when needed.
+- Provides settings and logs for proxy behavior.
 
-## Runtime Shape
+## Why Use It
 
-The app runs in-process and starts the CONNECT proxy as a managed subprocess
-through `ctx.services`. Route handlers use `ctx.db` and `ctx.secrets`; the
-subprocess uses direct workspace imports so it can access the same database
-tables and secret-store file without a framework context object.
+Use this app with Browser when web work requires authenticated sessions. It is useful for testing private pages, using web dashboards, validating user flows behind login, and letting agents operate pages that need the user's existing access.
 
-## Configuration
+## How To Use It
 
-`browser_cdp_list_url` controls the CDP `/json/list` endpoint used for cookie
-injection and cleanup. Keep it configurable so the workspace can point the
-proxy at the browser runtime used in that environment.
+Install Proxy before Browser. Configure its settings if the defaults do not match the workspace network. Use the supported cookie-sync extension to send browser cookies into the workspace, then open Browser and visit the authenticated site.
 
-## Layout
+## What It Delivers
 
-```text
-aw-app.json                        manifest
-proxy_app/
-  plugin.py                        registers routes and managed service
-  proxy_server.py                  CONNECT tunnel and cookie-sync HTTP server
-  routes.py                        cookie keys, persistent cookies, downloads
-  cookie_store.py                  persisted cookie table access
-  crypto.py                        Fernet encrypt/decrypt helpers
-  cdp.py                           raw-socket CDP client
-extensions/
-  aw-sync-chrome/                  Chrome extension
-  aw-sync-ios/                     Safari Web Extension and host app
-windows/main.json                  declarative settings window
-tests/
-  validate_manifest.py             manifest and window checks
-  test_cookie_store.py             cookie-store unit tests
-```
-
-## Testing
-
-```bash
-.venv/aw/bin/python tests/validate_manifest.py
-.venv/aw/bin/python -m pytest tests/test_cookie_store.py -q
-```
-
-Live CONNECT and CDP behavior should be verified in a running workspace with
-an available browser CDP endpoint.
+The app gives AW Workspace a controlled way to support authenticated browsing. It keeps Browser useful for real logged-in workflows while keeping the proxy private to the workspace environment.
