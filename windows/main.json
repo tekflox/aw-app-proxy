@@ -14,30 +14,12 @@
       ]
     },
     {
-      "id": "persisted-cookies",
+      "id": "cookies",
       "widgets": [
-        { "type": "markdown", "value": "### Persisted cookies\nCookies marked here survive a proxy restart — re-injected into the browser on startup." },
+        { "type": "markdown", "value": "### Cookies\nCookies persisted here survive a proxy restart — re-injected into the browser on startup." },
         {
-          "type": "table",
-          "bind": "GET /api/apps/proxy/cookie-keys",
-          "items_field": "keys",
-          "columns": [
-            { "field": "name", "label": "Name" },
-            { "field": "domain", "label": "Domain" },
-            { "field": "persisted", "label": "Persisted" }
-          ],
-          "row_actions": [
-            {
-              "label": "Persist",
-              "visible_when": { "field": "persisted", "equals": false },
-              "action": { "call": "POST /api/apps/proxy/persistent-cookies/{name}" }
-            },
-            {
-              "label": "Forget",
-              "visible_when": { "field": "persisted", "equals": true },
-              "action": { "call": "DELETE /api/apps/proxy/persistent-cookies/{name}" }
-            }
-          ]
+          "type": "iframe",
+          "src": "/api/apps/proxy/panel/cookies"
         }
       ]
     },

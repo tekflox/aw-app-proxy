@@ -14,6 +14,7 @@ GET    /persisted-cookie-values    → decrypted values (debug/inspection —
 POST   /browser-cookies/clear      → clear cookies in the live browser
 GET    /extensions/chrome.zip      → download the Chrome sync extension
 GET    /extensions/ios-readme      → iOS/Safari extension setup instructions
+GET    /panel/cookies              → the Settings panel's cookies view (see cookies_ui.py)
 """
 from __future__ import annotations
 
@@ -23,10 +24,11 @@ import re
 import zipfile
 
 from fastapi import Body, FastAPI
-from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
 
 from . import cdp
 from .cookie_store import CookieStore
+from .cookies_ui import COOKIES_UI_HTML
 from .crypto import decrypt, encrypt
 
 _PACKAGE_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -334,5 +336,11 @@ def build_app(ctx, store: CookieStore | None = None) -> FastAPI:
                 return PlainTextResponse(f.read())
         except FileNotFoundError:
             return PlainTextResponse("iOS extension README not found.", status_code=404)
+
+    # NOT under /ui/ — core owns GET /api/apps/{slug}/ui/{path:path} for
+    # component-mode ESM bundles and shadows anything an app mounts there.
+    @app.get("/panel/cookies", response_class=HTMLResponse)
+    async def cookies_ui() -> HTMLResponse:
+        return HTMLResponse(COOKIES_UI_HTML)
 
     return app
