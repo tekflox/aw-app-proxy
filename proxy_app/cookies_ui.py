@@ -46,9 +46,10 @@ COOKIES_UI_HTML = """<!doctype html>
 
   .hint { font-size: 11px; color: var(--muted); margin: 0 0 10px; line-height: 1.5; }
 
+  .toolbar { display: flex; gap: 6px; margin-bottom: 10px; }
   input[type=search] { font: inherit; font-size: 12px; padding: 6px 8px; border-radius: 6px;
                   border: 1px solid var(--line); background: rgba(128,128,128,.08);
-                  color: inherit; width: 100%; margin-bottom: 10px; }
+                  color: inherit; width: 100%; flex: 1; min-width: 0; }
   input[type=search]:focus { outline: none; border-color: var(--accent); }
 
   .card { border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px;
@@ -83,7 +84,10 @@ COOKIES_UI_HTML = """<!doctype html>
 automatically — persistence isn't optional, so there's nothing to click for that.
 <b>Forget</b> is the only manual action: it deletes a cookie from the database.</p>
 <div id="msg"></div>
-<input type="search" id="search" placeholder="Filter by name or domain…">
+<div class="toolbar">
+  <input type="search" id="search" placeholder="Filter by name or domain…">
+  <button id="refresh-btn" type="button">Refresh</button>
+</div>
 <div id="list"></div>
 
 <script>
@@ -178,6 +182,20 @@ $('list').addEventListener('click', async (e) => {
 });
 
 $('search').addEventListener('input', render);
+
+$('refresh-btn').addEventListener('click', async () => {
+  $('refresh-btn').disabled = true;
+  $('refresh-btn').textContent = 'Refreshing…';
+  try {
+    await refresh();
+    say('', 'ok');
+  } catch (err) {
+    say('Could not load cookies: ' + esc(err.message), 'err');
+  } finally {
+    $('refresh-btn').disabled = false;
+    $('refresh-btn').textContent = 'Refresh';
+  }
+});
 
 refresh().catch((err) => say('Could not load cookies: ' + esc(err.message), 'err'));
 </script>
