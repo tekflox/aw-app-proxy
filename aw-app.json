@@ -2,7 +2,7 @@
   "manifest_version": 1,
   "id": "proxy",
   "name": "Proxy",
-  "version": "0.6.1",
+  "version": "0.7.0",
   "description": "Browser cookie proxy: an HTTP CONNECT proxy the AW Browser tunnels through, plus the cookie-sync API (/sync-cookies, /clear-cookies) that the aw-sync browser extensions (Chrome + iOS/Safari) push the user's real-browser cookies through, and encrypted persistence of chosen cookies in Postgres so they survive a proxy restart. aw-app-browser depends on this app for authentication.",
   "tier": "inprocess",
   "category": "Service",
