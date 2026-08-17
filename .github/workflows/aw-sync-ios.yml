@@ -1,0 +1,119 @@
+name: AW Sync Extension — iOS TestFlight
+
+# Builds the AW Sync Safari extension host app and uploads it to TestFlight.
+#
+# Ported here 2026-08-17 from fredericowu/agentic-workspace, which still builds
+# `tools/browser/aw-sync-extension-ios` — a copy that has drifted badly behind
+# this one (it still sends the legacy `aw_jwt` cookie in an `X-AW-JWT` header
+# and hardcodes the /api/apps/proxy path shape, so a build from there cannot
+# authenticate against a current workspace at all). The extension source lives
+# in this repo now, so the pipeline that ships it does too.
+#
+# The Xcode project is NOT committed — setup.sh generates it at CI time with
+# xcrun safari-web-extension-converter, which ships inside Xcode.
+#
+# Required repo secrets (Settings → Secrets and variables → Actions). None of
+# these are set on this repo yet; they currently exist only on
+# fredericowu/agentic-workspace, and GitHub does not allow reading a secret
+# back, so they have to be re-entered here (or promoted to a tekflox org
+# secret, which every app repo would then inherit):
+#   ASC_KEY_ID                     App Store Connect API key — Key ID
+#   ASC_ISSUER_ID                  App Store Connect API key — Issuer ID
+#   ASC_KEY_CONTENT_B64            The .p8 key file, base64-encoded
+#   APPLE_TEAM_ID                  Apple Developer Team ID
+#   MATCH_PASSWORD                 Passphrase for the fastlane match cert repo
+#   MATCH_GIT_BASIC_AUTHORIZATION  base64(user:token) for the certs repo
+#
+# Manual only — same call Frederico made on 2026-07-26 for the monolith copy:
+# no automatic GHA runs. Dispatch from the Actions tab.
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: aw-sync-ios-testflight
+  cancel-in-progress: false
+
+jobs:
+  testflight:
+    # GitHub-hosted, not the self-hosted mac-fred: that runner is registered
+    # to fredericowu/aw-mobile specifically so the ASC/match secrets stay in
+    # GitHub instead of being copied onto the machine, and a repo-scoped
+    # runner cannot be borrowed by another repo anyway.
+    runs-on: macos-26
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: extensions/aw-sync-ios
+    env:
+      ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+      ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+      ASC_KEY_CONTENT_B64: ${{ secrets.ASC_KEY_CONTENT_B64 }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
+      MATCH_GIT_BASIC_AUTHORIZATION: ${{ secrets.MATCH_GIT_BASIC_AUTHORIZATION }}
+      MATCH_GIT_URL: https://github.com/fredericowu/aw-meta-display-certs.git
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fail early on a missing secret
+        run: |
+          missing=""
+          for v in ASC_KEY_ID ASC_ISSUER_ID ASC_KEY_CONTENT_B64 APPLE_TEAM_ID \
+                   MATCH_PASSWORD MATCH_GIT_BASIC_AUTHORIZATION; do
+            [ -n "${!v}" ] || missing="$missing $v"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::Missing repo secret(s):$missing — see the header of this workflow."
+            exit 1
+          fi
+          echo "All six signing secrets present."
+
+      - name: Select newest Xcode
+        run: |
+          echo "Available Xcodes:"; ls -d /Applications/Xcode_*.app
+          latest="$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)"
+          echo "Selecting $latest"
+          sudo xcode-select -s "$latest"
+          xcodebuild -version
+
+      - name: Generate Xcode project via setup.sh
+        run: bash setup.sh
+
+      - name: Create shared Xcode scheme (extract GUIDs from project.pbxproj)
+        run: |
+          pbxproj="AW Sync/AW Sync.xcodeproj/project.pbxproj"
+          shared="AW Sync/AW Sync.xcodeproj/xcshareddata/xcschemes"
+          mkdir -p "$shared"
+          ios_guid=$(grep -B2 '"AW Sync (iOS)"' "$pbxproj" | grep -oE '[A-F0-9]{24}' | head -1)
+          echo "iOS target GUID: $ios_guid"
+          cat > "$shared/AW Sync (iOS).xcscheme" << EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <Scheme LastUpgradeVersion="1500" version="1.3">
+            <BuildAction parallelizeBuildables="YES" buildImplicitDependencies="YES">
+              <BuildActionEntries>
+                <BuildActionEntry buildForTesting="YES" buildForRunning="YES" buildForProfiling="YES" buildForArchiving="YES" buildForAnalyzing="YES">
+                  <BuildableReference BuildableIdentifier="primary" BlueprintIdentifier="${ios_guid}" BuildableName="AW Sync.app" BlueprintName="AW Sync (iOS)" ReferencedContainer="container:AW Sync.xcodeproj"/>
+                </BuildActionEntry>
+              </BuildActionEntries>
+            </BuildAction>
+            <ArchiveAction buildConfiguration="Release" revealArchiveInOrganizer="YES"/>
+          </Scheme>
+          EOF
+          echo "Scheme created:"
+          cat "$shared/AW Sync (iOS).xcscheme"
+
+      - name: Show generated schemes
+        run: xcodebuild -list -project "AW Sync/AW Sync.xcodeproj"
+
+      - name: Write App Store Connect API key
+        run: |
+          mkdir -p "$RUNNER_TEMP/asc"
+          printf '%s' "$ASC_KEY_CONTENT_B64" | base64 --decode > "$RUNNER_TEMP/asc/AuthKey.p8"
+          echo "ASC_KEY_PATH=$RUNNER_TEMP/asc/AuthKey.p8" >> "$GITHUB_ENV"
+
+      - name: Install Fastlane
+        run: gem install fastlane --no-document
+
+      - name: Build & upload to TestFlight
+        run: fastlane beta
