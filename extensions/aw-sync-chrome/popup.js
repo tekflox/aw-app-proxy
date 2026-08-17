@@ -206,6 +206,36 @@ async function authedPost(url, body) {
   return result;
 }
 
+// The server persists every cookie unconditionally and only THEN tries to
+// inject them into a live browser — aw-app-browser is a separate app that is
+// very often simply stopped. Reporting `injected` alone painted a perfectly
+// good sync red ("0 synced, 0 failed") in exactly that case, even though every
+// cookie was safely stored and the proxy's reconnect loop would inject them
+// the moment the browser came up. Report what was STORED; treat the live
+// injection as the bonus step it actually is.
+function readSyncResult(result) {
+  return {
+    persisted: result.persisted ?? 0,
+    injected:  result.injected  || 0,
+    failed:    result.failed    || 0,
+    // Older proxy builds predate this field; absent means "assume reachable".
+    browserReachable: result.browser_reachable !== false,
+  };
+}
+
+function describeSync({ persisted, injected, failed, browserReachable }) {
+  if (!browserReachable) {
+    return {
+      text: `Done: ${persisted} stored (browser offline — injected when it starts)`,
+      ok:   persisted > 0,
+    };
+  }
+  return {
+    text: `Done: ${persisted} stored, ${injected} injected${failed ? `, ${failed} failed` : ""}`,
+    ok:   persisted > 0 && failed === 0,
+  };
+}
+
 async function injectCookies(cookies) {
   const mapped = cookies.map((c) => ({
     name: c.name,
@@ -227,14 +257,19 @@ async function injectCookies(cookies) {
   const proxyUrl = buildProxyUrl(hostInput.value);
 
   const result = await authedPost(proxyUrl, { cookies: mapped });
-  return { injected: result.injected || 0, failed: result.failed || 0 };
+  return readSyncResult(result);
 }
 
 async function postClear(payload) {
   await saveHost(hostInput.value);
   const url = buildClearUrl(hostInput.value);
   const result = await authedPost(url, payload);
-  return { cleared: result.cleared ?? 0, failed: result.failed ?? 0 };
+  return {
+    purged: result.purged ?? 0,
+    cleared: result.cleared ?? 0,
+    failed: result.failed ?? 0,
+    browserReachable: result.browser_reachable !== false,
+  };
 }
 
 function showNotLoggedIn(err) {
@@ -267,9 +302,12 @@ document.getElementById("sync-current").addEventListener("click", async () => {
       .join("");
     domainsEl.style.display = "block";
 
-    const { injected, failed } = await injectCookies(cookies);
-    setStatus(`Done: ${injected} synced, ${failed} failed`, injected > 0 ? "success" : "error");
-    statsEl.textContent = `${cookies.length} cookies read, ${injected} injected into container`;
+    const res = await injectCookies(cookies);
+    const { text, ok } = describeSync(res);
+    setStatus(text, ok ? "success" : "error");
+    statsEl.textContent = res.browserReachable
+      ? `${cookies.length} cookies read, ${res.injected} injected into container`
+      : `${cookies.length} cookies read, ${res.persisted} stored for the container`;
   } catch (e) {
     if (e instanceof NotLoggedInError) showNotLoggedIn(e);
     else setStatus(`Error: ${e.message}`, "error");
@@ -296,10 +334,12 @@ document.getElementById("clear-current").addEventListener("click", async () => {
       domain: c.domain,
       path: c.path || "/",
     }));
-    const { cleared, failed } = await postClear({ cookies: tuples });
+    const { purged, cleared, failed, browserReachable } = await postClear({ cookies: tuples });
     setStatus(
-      `Cleared ${cleared} cookies${failed ? `, ${failed} failed` : ""}.`,
-      cleared > 0 ? "success" : "error",
+      browserReachable
+        ? `Cleared ${purged} stored, ${cleared} evicted from the browser${failed ? `, ${failed} failed` : ""}.`
+        : `Cleared ${purged} stored cookies (browser offline).`,
+      purged > 0 || cleared > 0 ? "success" : "error",
     );
   } catch (e) {
     if (e instanceof NotLoggedInError) showNotLoggedIn(e);
@@ -317,16 +357,15 @@ document.getElementById("clear-all").addEventListener("click", async () => {
   btn.disabled = true;
   setStatus("Clearing every cookie on server...");
   try {
-    const { cleared, failed } = await postClear({ all: true });
-    // cleared === -1 is the proxy.py sentinel meaning "all-at-once succeeded"
-    // (Network.clearBrowserCookies doesn't return a count).
-    if (failed > 0 && cleared <= 0) {
-      setStatus("Failed to clear cookies.", "error");
-    } else if (cleared === -1) {
-      setStatus("All cookies cleared on server.", "success");
-    } else {
-      setStatus(`Cleared ${cleared} cookies.`, "success");
-    }
+    // The stored count is authoritative — wiping the live browser session is
+    // best-effort and returns no count of its own.
+    const { purged, browserReachable } = await postClear({ all: true });
+    setStatus(
+      browserReachable
+        ? `Cleared ${purged} stored cookies and wiped the live browser session.`
+        : `Cleared ${purged} stored cookies (browser offline — nothing left to inject).`,
+      "success",
+    );
   } catch (e) {
     if (e instanceof NotLoggedInError) showNotLoggedIn(e);
     else setStatus(`Error: ${e.message}`, "error");

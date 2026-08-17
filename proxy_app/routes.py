@@ -281,35 +281,58 @@ def build_app(ctx, store: CookieStore | None = None) -> FastAPI:
     @app.post("/clear-cookies")  # alias the aw-sync extensions POST to
     @app.post("/browser-cookies/clear")
     async def clear_browser_cookies(body: dict = Body(default={})):
+        """Purge-then-evict, decoupled — the mirror image of ``sync_cookies``.
+
+        This used to 502 whenever the browser was down, which made the whole
+        endpoint a no-op exactly when you most want it (revoking a leaked
+        session while the browser happens to be off). Worse, when it *did*
+        work it only touched the live browser and left ``cookie_store``
+        intact — so the reconnect loop in ``plugin.py`` would faithfully
+        re-inject everything you had just cleared. The store is the source of
+        truth, so it is purged first and unconditionally; evicting from a
+        live session is the best-effort second step."""
         clear_all = bool(body.get("all"))
         cookies = body.get("cookies") or []
         if not clear_all and not cookies:
             return JSONResponse({"error": "nothing to clear"}, status_code=400)
 
+        if clear_all:
+            purged = store.delete_all()
+        else:
+            purged = sum(
+                1 for c in cookies
+                if c.get("name") and store.delete(c["name"])
+            )
+
         ws_url = cdp.cdp_ws_url(_cdp_list_url(ctx))
         if not ws_url:
-            return JSONResponse({"error": "CDP not reachable — is the browser running?"}, status_code=502)
-        sock = cdp.open_ws(ws_url)
-        if clear_all:
-            result = cdp.send_recv(sock, 1, "Network.clearBrowserCookies", {})
-            sock.close()
-            return {"ok": True, "cleared": "all"} if result is not None else JSONResponse(
-                {"error": "CDP command failed"}, status_code=502)
+            return {"ok": True, "purged": purged, "cleared": 0,
+                    "browser_reachable": False}
 
-        cleared = 0
-        for i, c in enumerate(cookies, start=1):
-            name = c.get("name", "")
-            if not name:
-                continue
-            params: dict = {"name": name}
-            if c.get("domain"):
-                params["domain"] = c["domain"]
-                params["path"] = c.get("path", "/")
-            result = cdp.send_recv(sock, i, "Network.deleteCookies", params)
-            if result is not None:
-                cleared += 1
-        sock.close()
-        return {"ok": True, "cleared": cleared}
+        sock = cdp.open_ws(ws_url)
+        try:
+            if clear_all:
+                result = cdp.send_recv(sock, 1, "Network.clearBrowserCookies", {})
+                return {"ok": True, "purged": purged,
+                        "cleared": "all" if result is not None else 0,
+                        "browser_reachable": True}
+
+            cleared = 0
+            for i, c in enumerate(cookies, start=1):
+                name = c.get("name", "")
+                if not name:
+                    continue
+                params: dict = {"name": name}
+                if c.get("domain"):
+                    params["domain"] = c["domain"]
+                    params["path"] = c.get("path", "/")
+                result = cdp.send_recv(sock, i, "Network.deleteCookies", params)
+                if result is not None:
+                    cleared += 1
+        finally:
+            sock.close()
+        return {"ok": True, "purged": purged, "cleared": cleared,
+                "browser_reachable": True}
 
     @app.get("/extensions/chrome.zip")
     async def download_chrome_extension():

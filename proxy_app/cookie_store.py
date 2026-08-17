@@ -75,6 +75,13 @@ class CookieStore:
         self.ctx.db.execute(TABLE, "DELETE FROM {table} WHERE name = :name", {"name": name})
         return True
 
+    def delete_all(self) -> int:
+        rows = self.ctx.db.execute(TABLE, "SELECT name FROM {table}")
+        if not rows:
+            return 0
+        self.ctx.db.execute(TABLE, "DELETE FROM {table}")
+        return len(rows)
+
     def all_rows(self) -> list[dict]:
         rows = self.ctx.db.execute(
             TABLE,
