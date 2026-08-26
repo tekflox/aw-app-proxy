@@ -18,12 +18,13 @@ differences from the original:
   calling back into an HTTP API with a bearer API key.
 
 CDP target (``--cdp-list-url`` / ``AW_PROXY_CDP_LIST_URL``, default
-``http://127.0.0.1:9223/json/list``): still the old hard-coded container-Chrome
-debug port from ``tools/browser/``. **Not yet reconciled** with
-``aw-app-browser``'s new Tier-2 (podman container; CDP reachable at
-``/api/apps/browser/*``) — see this repo's README. Configurable so the
-orchestrator can point it at the right place once that's decided, without
-needing new code here.
+``cdp.cdp_list_url_default()`` → ``http://aw-app-browser:9223/json/list``):
+reconciled with ``aw-app-browser``'s Tier-2 podman container on 2026-08-02 —
+it is reachable by container name on the shared workspace network, and the
+old ``127.0.0.1:9223`` inherited from ``tools/browser/`` would only ever have
+been this app's own loopback. Still configurable (``browser_cdp_list_url`` in
+app config, which ``plugin.py``/``routes.py`` prefer over the default) so the
+target can move without new code here.
 
 Usage:
     python -m proxy_app.proxy_server [--port 9124] [--cdp-list-url URL]
