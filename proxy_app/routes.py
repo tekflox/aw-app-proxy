@@ -11,6 +11,9 @@ DELETE /persistent-cookies/{name}  → remove from persistence
 GET    /persisted-cookie-values    → decrypted values (debug/inspection —
                                       proxy_server.py reads the DB directly
                                       on startup, see cookie_store.py)
+GET    /cookies-for?url=…          → cookies (with values) that would be sent
+                                      to one URL — loopback-only, for another
+                                      Tier-1 app borrowing browser sessions
 POST   /browser-cookies/clear      → clear cookies in the live browser
 GET    /extensions/chrome.zip      → download the Chrome sync extension
 GET    /extensions/ios-readme      → iOS/Safari extension setup instructions
@@ -22,11 +25,12 @@ import io
 import os
 import re
 import zipfile
+from urllib.parse import urlparse
 
 from fastapi import Body, FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
 
-from . import cdp
+from . import cdp, cookie_match
 from .cookie_store import CookieStore
 from .cookies_ui import COOKIES_UI_HTML
 from .crypto import decrypt, encrypt
@@ -199,6 +203,68 @@ def build_app(ctx, store: CookieStore | None = None) -> FastAPI:
                 entry["expires"] = row["expires"]
             cookies.append(entry)
         return {"cookies": cookies, "protected_names": protected_names}
+
+    @app.get("/cookies-for")
+    async def cookies_for(url: str):
+        """Cookies that would be sent to ``url``, **with their values** —
+        so another Tier-1 app can borrow this workspace's logged-in browser
+        sessions for a server-side fetch (today: aw-app-mini-browser's Bare
+        Server, which has its own jar in the user's browser and no way to
+        see this one).
+
+        This is the ONE route in this app that returns cookie *values*;
+        every other one (``/cookie-keys``) deliberately returns names and
+        domains only. Two things bound it, and both matter:
+
+        * **Loopback only.** Declared in ``aw-app.json`` as a ``local_paths``
+          entry (needs ``routes:local``), so ``IdentityGuard`` skips the JWT
+          check for 127.0.0.1 callers and 401s everyone else — this is not
+          reachable from outside the workspace container at all. Same
+          mechanism ``aw-app-devctl`` uses for ``/eval``. The residual risk
+          is honest and worth naming: anything already running *inside* the
+          workspace can read session cookies through it.
+        * **Per-URL, never bulk.** There is no "give me everything" form.
+          A caller has to name the origin it is fetching, and gets back only
+          what that origin would have received anyway.
+
+        Live browser first (Chrome does its own matching via
+        ``Network.getCookies``' ``urls`` filter — more correct than anything
+        we could reimplement); persisted store as the fallback, so a stopped
+        aw-app-browser degrades to "the cookies you chose to keep" instead
+        of "no cookies at all".
+        """
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            return JSONResponse(
+                {"error": "url must be an absolute http(s) URL"}, status_code=400)
+
+        ws_url = cdp.cdp_ws_url(_cdp_list_url(ctx))
+        if ws_url:
+            sock = cdp.open_ws(ws_url)
+            try:
+                result = cdp.send_recv(sock, 1, "Network.getCookies", {"urls": [url]})
+            finally:
+                sock.close()
+            if result is not None:
+                cookies = result.get("result", {}).get("cookies", [])
+                return {"cookies": cookies, "source": "browser",
+                        "browser_reachable": True, "count": len(cookies)}
+
+        rows = store.all_rows()
+        cookies = []
+        for row in rows:
+            try:
+                value = decrypt(ctx, row["value_enc"])
+            except ValueError:
+                continue
+            cookies.append({
+                "name": row["name"], "value": value, "domain": row["domain"],
+                "path": row["path"] or "/", "secure": bool(row["secure"]),
+                "httpOnly": bool(row["http_only"]), "sameSite": row["same_site"],
+            })
+        selected = cookie_match.select(cookies, url)
+        return {"cookies": selected, "source": "store",
+                "browser_reachable": False, "count": len(selected)}
 
     @app.post("/sync-cookies")
     async def sync_cookies(body: dict = Body(default={})):
