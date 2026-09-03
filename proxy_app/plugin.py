@@ -72,11 +72,16 @@ class ProxyAppPlugin:
         log.info("aw-app-proxy activated (service port=%s)", port)
 
     async def _cookie_reconnect_loop(self) -> None:
-        """Periodically poll CDP reachability and, when the browser
-        transitions from unreachable → reachable (e.g. aw-app-browser was
-        restarted or is slow to come up), re-inject every persisted cookie
-        so an offline sync_cookies call eventually reaches a live browser
-        session with no cross-app callback required.
+        """Periodically re-inject every persisted cookie into the live
+        browser, on every poll tick while CDP is reachable — not only on an
+        unreachable → reachable transition. A browser that stays
+        continuously reachable can still have individual cookies cleared,
+        evicted or expired in-place (by an in-page action, Chrome's own
+        eviction, or another CDP client); an edge-only check never observes
+        that drift, so it never gets repaired until some unrelated
+        down→up transition happens to occur — which may be never.
+        ``Network.setCookie`` is idempotent, so reapplying already-correct
+        cookies on every tick is harmless.
 
         Chosen over an aw-app-browser startup-hook calling back into this
         app: aw-app-browser is a prebuilt Tier-2 container image (own repo,
@@ -88,13 +93,14 @@ class ProxyAppPlugin:
             try:
                 await asyncio.sleep(RECONNECT_POLL_SECONDS)
                 reachable = cdp.cdp_ws_url(routes_mod._cdp_list_url(self.ctx)) is not None
-                if reachable and not was_reachable:
+                if reachable:
                     injected, failed = await asyncio.to_thread(
                         routes_mod.restore_persisted_cookies, self.ctx, self.store)
                     if injected or failed:
                         log.info(
-                            "Cookie reconnect: browser back online, re-injected "
-                            "%s persisted cookie(s) (%s failed)", injected, failed)
+                            "Cookie reconnect: %sreconciled %s persisted cookie(s) (%s failed)",
+                            "browser back online, " if not was_reachable else "",
+                            injected, failed)
                 was_reachable = reachable
             except asyncio.CancelledError:
                 raise
