@@ -414,9 +414,14 @@ class ThreadPoolHTTPServer(HTTPServer):
     daemon_threads = True
 
     def __init__(self, *args, max_workers: int = 32, **kwargs):
-        super().__init__(*args, **kwargs)
+        # Constructed BEFORE super().__init__(): socketserver.TCPServer's own
+        # __init__ calls self.server_close() from its exception handler if
+        # server_bind()/server_activate() raises (e.g. port already in use),
+        # and that was crashing with AttributeError (self._pool not set yet)
+        # instead of letting the real OSError surface — see server_close().
         from concurrent.futures import ThreadPoolExecutor
         self._pool = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="proxy")
+        super().__init__(*args, **kwargs)
 
     def process_request(self, request, client_address):
         self._pool.submit(self._handle, request, client_address)
@@ -431,7 +436,8 @@ class ThreadPoolHTTPServer(HTTPServer):
 
     def server_close(self):
         super().server_close()
-        self._pool.shutdown(wait=False)
+        if self._pool is not None:
+            self._pool.shutdown(wait=False)
 
 
 def _restore_cookies() -> None:
