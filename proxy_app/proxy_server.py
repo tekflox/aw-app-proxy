@@ -58,6 +58,17 @@ _CDP_LIST_URL = os.environ.get("AW_PROXY_CDP_LIST_URL", cdp.cdp_list_url_default
 _ALLOWED_NETWORKS = [ipaddress.ip_network(n, strict=False)
                       for n in json.loads(os.environ.get("AW_PROXY_ALLOWED_NETWORKS", '["127.0.0.0/8"]'))]
 _MITM_ENABLED = os.environ.get("AW_PROXY_MITM_DISABLED") != "1"
+# Google's own bot-detection patent (US11184390B2) fingerprints the TLS
+# ClientHello (JA3/JA4) on login requests — our MITM's outbound leg uses
+# Python's OpenSSL, which doesn't match Chrome's BoringSSL fingerprint.
+# These hosts get the raw splice tunnel instead, so Google sees Chrome's
+# genuine TLS handshake end-to-end.
+_MITM_BYPASS_HOSTS = {
+    h.strip() for h in os.environ.get(
+        "AW_PROXY_MITM_BYPASS_HOSTS",
+        "accounts.google.com,accounts.youtube.com,myaccount.google.com",
+    ).split(",") if h.strip()
+}
 
 
 def _fernet_key() -> bytes | None:
@@ -149,7 +160,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             host = "127.0.0.1"
         log.info(f"CONNECT {host}:{port}")
 
-        if _MITM_ENABLED and port == 443:
+        if _MITM_ENABLED and port == 443 and host not in _MITM_BYPASS_HOSTS:
             try:
                 self._mitm_connect(host, port)
                 return
