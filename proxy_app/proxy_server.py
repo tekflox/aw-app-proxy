@@ -37,10 +37,12 @@ import json
 import logging
 import os
 import socket
+import ssl
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from . import cdp
+from . import mitm
 
 logging.basicConfig(
     level=logging.INFO,
@@ -55,6 +57,7 @@ _COOKIE_ENDPOINTS = ("/sync-cookies", "/clear-cookies")
 _CDP_LIST_URL = os.environ.get("AW_PROXY_CDP_LIST_URL", cdp.cdp_list_url_default())
 _ALLOWED_NETWORKS = [ipaddress.ip_network(n, strict=False)
                       for n in json.loads(os.environ.get("AW_PROXY_ALLOWED_NETWORKS", '["127.0.0.0/8"]'))]
+_MITM_ENABLED = os.environ.get("AW_PROXY_MITM_DISABLED") != "1"
 
 
 def _fernet_key() -> bytes | None:
@@ -66,6 +69,69 @@ def _fernet_key() -> bytes | None:
     except Exception:
         log.warning("could not read cookie_encryption_key from secret store", exc_info=True)
         return None
+
+
+def _read_message_head(rfile):
+    start_line = rfile.readline()
+    if not start_line:
+        return None, None
+    start_line = start_line.decode("iso-8859-1").rstrip("\r\n")
+    if not start_line:
+        return None, None
+    headers = []
+    while True:
+        line = rfile.readline()
+        if not line:
+            break
+        line = line.decode("iso-8859-1").rstrip("\r\n")
+        if not line:
+            break
+        k, _, v = line.partition(":")
+        headers.append((k.strip(), v.strip()))
+    return start_line, headers
+
+
+def _headers_get(headers, name):
+    name = name.lower()
+    for k, v in headers:
+        if k.lower() == name:
+            return v
+    return None
+
+
+def _read_body(rfile, headers):
+    te = (_headers_get(headers, "Transfer-Encoding") or "").lower()
+    if "chunked" in te:
+        chunks = []
+        while True:
+            size_line = rfile.readline().decode("iso-8859-1").strip()
+            if not size_line:
+                break
+            size = int(size_line.split(";")[0], 16)
+            if size == 0:
+                while True:
+                    line = rfile.readline()
+                    if not line or line in (b"\r\n", b"\n"):
+                        break
+                break
+            chunks.append(rfile.read(size))
+            rfile.read(2)
+        return b"".join(chunks)
+    length = _headers_get(headers, "Content-Length")
+    if length:
+        return rfile.read(int(length))
+    return b""
+
+
+def _write_message(sock, start_line, headers, body):
+    lines = [start_line]
+    for k, v in headers:
+        lines.append(f"{k}: {v}")
+    lines.append("")
+    lines.append("")
+    sock.sendall("\r\n".join(lines).encode("iso-8859-1"))
+    if body:
+        sock.sendall(body)
 
 
 class ProxyHandler(BaseHTTPRequestHandler):
@@ -82,6 +148,14 @@ class ProxyHandler(BaseHTTPRequestHandler):
         if host == "host.docker.internal":
             host = "127.0.0.1"
         log.info(f"CONNECT {host}:{port}")
+
+        if _MITM_ENABLED and port == 443:
+            try:
+                self._mitm_connect(host, port)
+                return
+            except Exception as e:
+                log.warning(f"MITM setup failed for {host}, falling back to raw tunnel: {e}")
+
         try:
             remote = socket.create_connection((host, port), timeout=30)
         except Exception as e:
@@ -327,6 +401,18 @@ class ProxyHandler(BaseHTTPRequestHandler):
         import urllib.request
 
         url = self.path.replace("host.docker.internal", "127.0.0.1")
+        if url == "/mitm-ca-spki":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(mitm.ca_spki_b64().encode())
+            return
+        if url == "/mitm-ca.pem":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-pem-file")
+            self.end_headers()
+            self.wfile.write(mitm.ca_cert_pem().encode())
+            return
         log.info(f"{self.command} {url}")
         skip = {"host", "proxy-connection", "connection", "keep-alive",
                 "proxy-authenticate", "proxy-authorization", "te",
@@ -374,7 +460,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     if not data:
                         break
                     dst.sendall(data)
-            except (socket.timeout, OSError, BrokenPipeError):
+            except (socket.timeout, OSError, BrokenPipeError, ssl.SSLError):
                 pass
             finally:
                 try:
@@ -392,6 +478,82 @@ class ProxyHandler(BaseHTTPRequestHandler):
             remote_sock.close()
         except OSError:
             pass
+
+    def _mitm_connect(self, host, port):
+        server_ctx = mitm.server_ssl_context(host)
+        self.send_response(200, "Connection Established")
+        self.end_headers()
+        try:
+            tls_client = server_ctx.wrap_socket(self.connection, server_side=True)
+        except ssl.SSLError as e:
+            raise RuntimeError(f"client TLS handshake failed: {e}") from e
+
+        raw_remote = socket.create_connection((host, port), timeout=30)
+        remote_ctx = mitm.client_ssl_context()
+        tls_remote = remote_ctx.wrap_socket(raw_remote, server_hostname=host)
+
+        self._relay_http(tls_client, tls_remote, host)
+
+    def _relay_http(self, client_sock, remote_sock, host):
+        client_rfile = client_sock.makefile("rb")
+        remote_rfile = remote_sock.makefile("rb")
+        try:
+            while True:
+                req_line, req_headers = _read_message_head(client_rfile)
+                if req_line is None:
+                    break
+
+                if (_headers_get(req_headers, "Upgrade") or "").strip():
+                    _write_message(remote_sock, req_line, req_headers, b"")
+                    self._tunnel(client_sock, remote_sock)
+                    return
+
+                req_body = _read_body(client_rfile, req_headers)
+                simple = {k.lower(): v for k, v in req_headers}
+                simple = mitm.rewrite_request_headers(simple)
+                drop = {"transfer-encoding", "content-length", "connection", "proxy-connection"}
+                new_headers = []
+                seen = set()
+                for k, v in req_headers:
+                    lk = k.lower()
+                    if lk in drop:
+                        continue
+                    new_headers.append((k, simple.get(lk, v)))
+                    seen.add(lk)
+                for lk, v in simple.items():
+                    if lk not in seen and lk not in drop:
+                        new_headers.append((lk, v))
+                if req_body:
+                    new_headers.append(("Content-Length", str(len(req_body))))
+                new_headers.append(("Connection", "keep-alive"))
+                _write_message(remote_sock, req_line, new_headers, req_body)
+
+                resp_line, resp_headers = _read_message_head(remote_rfile)
+                if resp_line is None:
+                    break
+                resp_body = _read_body(remote_rfile, resp_headers)
+                resp_new_headers = [
+                    (k, v) for k, v in resp_headers
+                    if k.lower() not in ("transfer-encoding", "content-length", "connection")
+                ]
+                resp_new_headers.append(("Content-Length", str(len(resp_body))))
+                resp_new_headers.append(("Connection", "keep-alive"))
+                _write_message(client_sock, resp_line, resp_new_headers, resp_body)
+
+                req_conn = (_headers_get(req_headers, "Connection") or "").lower()
+                resp_conn = (_headers_get(resp_headers, "Connection") or "").lower()
+                if "close" in req_conn or "close" in resp_conn:
+                    break
+        except (ConnectionError, ssl.SSLError, OSError):
+            pass
+        except Exception as e:
+            log.info(f"MITM relay for {host} ended: {e}")
+        finally:
+            for sk in (client_sock, remote_sock):
+                try:
+                    sk.close()
+                except Exception:
+                    pass
 
     def _parse_host_port(self, path, default_port=80):
         if ":" in path:
