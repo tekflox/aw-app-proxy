@@ -9,10 +9,17 @@ cookie must survive a restart/update/reinstall, encrypted in Postgres, with
 no opt-in step. ``/sync-cookies`` already persists unconditionally for the
 extension-push path; this page closes the gap for cookies the live browser
 has that haven't been pushed yet by calling ``POST
-/persistent-cookies/{name}`` for each of them automatically on load/refresh,
-same as a background sweep. The only *manual* action left is "Forget"
-(``DELETE /persistent-cookies/{name}``) — deletion is a deliberate choice,
-persistence is not.
+/persistent-cookies/{name}?domain=…`` for each of them automatically on
+load/refresh, same as a background sweep. The only *manual* action left is
+"Forget" (``DELETE /persistent-cookies/{name}?domain=…``) — deletion is a
+deliberate choice, persistence is not.
+
+Cards and the persist/forget calls are keyed on ``(name, domain)``, not name
+alone — cookie identity is ``(name, domain, path)`` (RFC 6265 §5.3), so the
+same name can legitimately show up more than once (e.g. ``.google.com`` and
+``accounts.google.com`` both carrying a cookie named the same thing).
+Forgetting one card only deletes that domain's row(s), not every domain
+sharing the name.
 
 ``windows/main.json`` used to declare a Persist/Forget pair as a ``table``
 widget's ``row_actions`` — that widget type was never implemented by
@@ -112,6 +119,14 @@ function esc(s) {
     ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
 
+// Cookie identity is (name, domain, path) — same name can legitimately
+// appear on several domains (e.g. .google.com / accounts.google.com), so
+// cards and the busy/forget state are keyed on (name, domain), not name
+// alone.
+function keyOf(k) {
+  return k.name + '\\u0000' + k.domain;
+}
+
 function render() {
   const q = $('search').value.toLowerCase().trim();
   const filtered = q
@@ -128,14 +143,15 @@ function render() {
   }
 
   $('list').innerHTML = filtered.map((k) => {
-    const isBusy = busy === k.name;
+    const isBusy = busy === keyOf(k);
     return '<div class="card">'
       + '<div class="name-wrap">'
       +   '<span class="name" title="' + esc(k.name) + '">' + esc(k.name) + '</span>'
       +   (k.domain ? '<span class="domain">' + esc(k.domain) + '</span>' : '')
       + '</div>'
       + (k.persisted ? '<span class="badge">DB</span>' : '<span class="badge pending">persisting\\u2026</span>')
-      + '<button class="danger" data-forget="' + esc(k.name) + '" ' + (isBusy ? 'disabled' : '') + '>Forget</button>'
+      + '<button class="danger" data-forget="' + esc(k.name) + '" data-domain="' + esc(k.domain) + '" '
+      +   (isBusy ? 'disabled' : '') + '>Forget</button>'
       + '</div>';
   }).join('');
 }
@@ -157,8 +173,10 @@ async function refresh() {
   const missing = keys.filter((k) => !k.persisted);
   if (!missing.length) return;
   for (const k of missing) {
-    try { await call('POST', '/persistent-cookies/' + encodeURIComponent(k.name)); }
-    catch (_e) { /* best-effort — will retry on next manual refresh */ }
+    try {
+      await call('POST', '/persistent-cookies/' + encodeURIComponent(k.name)
+        + '?domain=' + encodeURIComponent(k.domain));
+    } catch (_e) { /* best-effort — will retry on next manual refresh */ }
   }
   await loadKeys();
 }
@@ -168,11 +186,13 @@ $('list').addEventListener('click', async (e) => {
   if (!b) return;
   const name = b.getAttribute('data-forget');
   if (!name) return;
-  busy = name;
+  const domain = b.getAttribute('data-domain') || '';
+  busy = keyOf({ name, domain });
   render();
   try {
-    await call('DELETE', '/persistent-cookies/' + encodeURIComponent(name));
-    say('Forgot "' + esc(name) + '" — removed from the database.', 'ok');
+    await call('DELETE', '/persistent-cookies/' + encodeURIComponent(name)
+      + '?domain=' + encodeURIComponent(domain));
+    say('Forgot "' + esc(name) + '" (' + esc(domain) + ') — removed from the database.', 'ok');
   } catch (err) {
     say(esc(err.message), 'err');
   } finally {

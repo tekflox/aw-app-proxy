@@ -103,5 +103,7 @@
   "dependencies": {
     "note": "No required app dependencies. aw-app-browser declares proxy as a required dependency; aw-workspace now enforces that edge at install/reconcile time."
   },
-  "migrations": {}
+  "migrations": {
+    "dir": "migrations"
+  }
 }

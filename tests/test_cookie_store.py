@@ -77,23 +77,64 @@ def test_upsert_and_list_names(store):
     assert store.list_names() == ["aw_jwt", "session"]
 
 
-def test_upsert_is_idempotent_on_conflict(store):
-    store.upsert({"name": "aw_jwt", "value_enc": "enc1", "domain": "d1"})
-    store.upsert({"name": "aw_jwt", "value_enc": "enc2", "domain": "d2"})
+def test_upsert_is_idempotent_on_conflict_same_identity(store):
+    store.upsert({"name": "aw_jwt", "value_enc": "enc1", "domain": "d1", "path": "/"})
+    store.upsert({"name": "aw_jwt", "value_enc": "enc2", "domain": "d1", "path": "/"})
     rows = store.all_rows()
     assert len(rows) == 1
     assert rows[0]["value_enc"] == "enc2"
-    assert rows[0]["domain"] == "d2"
+    assert rows[0]["domain"] == "d1"
+
+
+def test_upsert_same_name_different_domain_keeps_both_rows(store):
+    # Regression for the bug this composite key fixes: a name-only PRIMARY
+    # KEY let same-name cookies from different domains silently overwrite
+    # each other — the motivating case is Google's session cookies, which
+    # share names across .google.com / accounts.google.com / mail.google.com.
+    store.upsert({"name": "SID", "value_enc": "enc-root", "domain": ".google.com"})
+    store.upsert({"name": "SID", "value_enc": "enc-accounts", "domain": "accounts.google.com"})
+    rows = store.all_rows()
+    assert len(rows) == 2
+    by_domain = {r["domain"]: r["value_enc"] for r in rows}
+    assert by_domain == {".google.com": "enc-root", "accounts.google.com": "enc-accounts"}
+
+
+def test_upsert_same_name_domain_different_path_keeps_both_rows(store):
+    store.upsert({"name": "sid", "value_enc": "enc-root", "domain": "example.com", "path": "/"})
+    store.upsert({"name": "sid", "value_enc": "enc-app", "domain": "example.com", "path": "/app"})
+    rows = store.all_rows()
+    assert len(rows) == 2
+
+
+def test_list_names_dedupes_across_domains(store):
+    store.upsert({"name": "SID", "value_enc": "enc1", "domain": ".google.com"})
+    store.upsert({"name": "SID", "value_enc": "enc2", "domain": "accounts.google.com"})
+    assert store.list_names() == ["SID"]
+
+
+def test_persisted_keys_returns_name_domain_pairs(store):
+    store.upsert({"name": "SID", "value_enc": "enc1", "domain": ".google.com"})
+    store.upsert({"name": "SID", "value_enc": "enc2", "domain": "accounts.google.com"})
+    assert store.persisted_keys() == {("SID", ".google.com"), ("SID", "accounts.google.com")}
 
 
 def test_delete_returns_false_when_missing(store):
     assert store.delete("nope") is False
 
 
-def test_delete_removes_row(store):
+def test_delete_name_only_removes_all_domains(store):
     store.upsert({"name": "aw_jwt", "value_enc": "enc1"})
     assert store.delete("aw_jwt") is True
     assert store.list_names() == []
+
+
+def test_delete_with_domain_only_removes_that_domain(store):
+    store.upsert({"name": "SID", "value_enc": "enc1", "domain": ".google.com"})
+    store.upsert({"name": "SID", "value_enc": "enc2", "domain": "accounts.google.com"})
+    assert store.delete("SID", ".google.com") is True
+    rows = store.all_rows()
+    assert len(rows) == 1
+    assert rows[0]["domain"] == "accounts.google.com"
 
 
 def test_encrypt_decrypt_roundtrip(ctx):

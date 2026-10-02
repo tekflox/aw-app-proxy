@@ -236,6 +236,95 @@ function describeSync({ persisted, injected, failed, browserReachable }) {
   };
 }
 
+// ── Browser signature ────────────────────────────────────────────────────
+//
+// Captured alongside the cookies so a later consumer can present an
+// identity consistent with the real browser those cookies came from,
+// instead of a guessed one. Read straight off navigator/screen/Intl in
+// THIS popup — it's a page in the real browser, so its own globals are the
+// real browser's. Every group is isolated in its own try/catch: a field
+// the browser doesn't report (or an API that throws/rejects) must come
+// back null/unset, NEVER a hardcoded fallback — a fabricated field is
+// exactly what got aw-app-browser bot-flagged by Google. The server's
+// normalize() is the actual null guarantee (JSON.stringify drops unset
+// keys entirely), this is just not inventing a value to begin with.
+
+const SOURCE_ID_KEY = "awSourceId";
+
+async function getSourceId() {
+  try {
+    const stored = await chrome.storage.local.get(SOURCE_ID_KEY);
+    if (stored[SOURCE_ID_KEY]) return stored[SOURCE_ID_KEY];
+  } catch (_) {
+    // fall through to generating one for this call
+  }
+  const id = crypto.randomUUID();
+  try {
+    await chrome.storage.local.set({ [SOURCE_ID_KEY]: id });
+  } catch (_) {
+    // best-effort persistence — a regenerated id next sync just looks like
+    // a new source, which is the documented cost of this grain
+  }
+  return id;
+}
+
+async function collectSignature() {
+  const sig = { source_id: await getSourceId(), variant: "chrome" };
+
+  try {
+    sig.user_agent = navigator.userAgent;
+    sig.platform = navigator.platform;
+    sig.languages = navigator.languages ? Array.from(navigator.languages) : null;
+  } catch (_) { /* leave unset */ }
+
+  try {
+    sig.timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  } catch (_) { /* leave unset */ }
+
+  try {
+    sig.screen = {
+      width: screen.width,
+      height: screen.height,
+      availWidth: screen.availWidth,
+      availHeight: screen.availHeight,
+      colorDepth: screen.colorDepth,
+      pixelRatio: window.devicePixelRatio || null,
+    };
+  } catch (_) { /* leave unset */ }
+
+  try {
+    sig.hardware_concurrency = navigator.hardwareConcurrency ?? null;
+  } catch (_) { /* leave unset */ }
+
+  try {
+    sig.device_memory = navigator.deviceMemory ?? null; // not exposed on Safari/Firefox
+  } catch (_) { /* leave unset */ }
+
+  try {
+    const uaData = navigator.userAgentData; // absent on Safari/Firefox
+    if (uaData) {
+      const highEntropy = await uaData.getHighEntropyValues([
+        "platform", "platformVersion", "architecture", "bitness",
+        "model", "uaFullVersion", "fullVersionList", "wow64",
+      ]).catch(() => null); // rejects on some Chrome builds — null, never a guessed brand/version
+      sig.ua_ch = {
+        brands: uaData.brands || null,
+        mobile: uaData.mobile ?? null,
+        platform: highEntropy?.platform ?? null,
+        platformVersion: highEntropy?.platformVersion ?? null,
+        architecture: highEntropy?.architecture ?? null,
+        bitness: highEntropy?.bitness ?? null,
+        model: highEntropy?.model ?? null,
+        uaFullVersion: highEntropy?.uaFullVersion ?? null,
+        fullVersionList: highEntropy?.fullVersionList ?? null,
+        wow64: highEntropy?.wow64 ?? null,
+      };
+    }
+  } catch (_) { /* leave unset */ }
+
+  return sig;
+}
+
 async function injectCookies(cookies) {
   const mapped = cookies.map((c) => ({
     name: c.name,
@@ -256,7 +345,17 @@ async function injectCookies(cookies) {
   await saveHost(hostInput.value);
   const proxyUrl = buildProxyUrl(hostInput.value);
 
-  const result = await authedPost(proxyUrl, { cookies: mapped });
+  // Signature capture is a secondary, best-effort feature — it must never
+  // block or fail the cookie sync itself (PO criterion 4).
+  let signature = null;
+  try {
+    signature = await collectSignature();
+  } catch (_) {
+    signature = null;
+  }
+
+  const body = signature ? { cookies: mapped, signature } : { cookies: mapped };
+  const result = await authedPost(proxyUrl, body);
   return readSyncResult(result);
 }
 

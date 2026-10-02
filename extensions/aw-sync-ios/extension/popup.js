@@ -279,6 +279,96 @@ function describeSync({ persisted, injected, failed, browserReachable }) {
   };
 }
 
+// ── Browser signature ────────────────────────────────────────────────────
+//
+// Captured alongside the cookies so a later consumer can present an
+// identity consistent with the real browser those cookies came from,
+// instead of a guessed one. Read straight off navigator/screen/Intl in
+// THIS popup — it's a page in the real browser, so its own globals are the
+// real browser's. Every group is isolated in its own try/catch: a field
+// the browser doesn't report (or an API that throws/rejects) must come
+// back null/unset, NEVER a hardcoded fallback — a fabricated field is
+// exactly what got aw-app-browser bot-flagged by Google. The server's
+// normalize() is the actual null guarantee (JSON.stringify drops unset
+// keys entirely), this is just not inventing a value to begin with.
+
+const SOURCE_ID_KEY = "awSourceId";
+
+async function getSourceId() {
+  try {
+    const stored = await chrome.storage.local.get(SOURCE_ID_KEY);
+    if (stored[SOURCE_ID_KEY]) return stored[SOURCE_ID_KEY];
+  } catch (_) {
+    // fall through to generating one for this call
+  }
+  const id = crypto.randomUUID();
+  try {
+    await chrome.storage.local.set({ [SOURCE_ID_KEY]: id });
+  } catch (_) {
+    // best-effort persistence — a regenerated id next sync just looks like
+    // a new source, which is the documented cost of this grain
+  }
+  return id;
+}
+
+async function collectSignature() {
+  const sig = { source_id: await getSourceId(), variant: "ios" };
+
+  try {
+    sig.user_agent = navigator.userAgent;
+    sig.platform = navigator.platform;
+    sig.languages = navigator.languages ? Array.from(navigator.languages) : null;
+  } catch (_) { /* leave unset */ }
+
+  try {
+    sig.timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  } catch (_) { /* leave unset */ }
+
+  // NOT captured on iOS: this popup renders in a Safari Web Extension
+  // sheet, not a full-device window, and it could not be verified on real
+  // iOS hardware in this change whether `screen.*` there reports the
+  // physical device display (per spec) or the popup sheet's own small
+  // frame. Sending a popup-sheet size as "screen" would be exactly the
+  // kind of fabricated field this capture is required never to produce
+  // (PO criterion 2) — so this stays null until someone can confirm on a
+  // real device which one Safari actually reports here.
+  sig.screen = null;
+
+  try {
+    sig.hardware_concurrency = navigator.hardwareConcurrency ?? null;
+  } catch (_) { /* leave unset */ }
+
+  try {
+    sig.device_memory = navigator.deviceMemory ?? null; // not exposed on Safari
+  } catch (_) { /* leave unset */ }
+
+  // navigator.userAgentData doesn't exist on Safari — sig.ua_ch stays
+  // unset, which is exactly the "UA-CH fields null on iOS" criterion.
+  try {
+    const uaData = navigator.userAgentData;
+    if (uaData) {
+      const highEntropy = await uaData.getHighEntropyValues([
+        "platform", "platformVersion", "architecture", "bitness",
+        "model", "uaFullVersion", "fullVersionList", "wow64",
+      ]).catch(() => null);
+      sig.ua_ch = {
+        brands: uaData.brands || null,
+        mobile: uaData.mobile ?? null,
+        platform: highEntropy?.platform ?? null,
+        platformVersion: highEntropy?.platformVersion ?? null,
+        architecture: highEntropy?.architecture ?? null,
+        bitness: highEntropy?.bitness ?? null,
+        model: highEntropy?.model ?? null,
+        uaFullVersion: highEntropy?.uaFullVersion ?? null,
+        fullVersionList: highEntropy?.fullVersionList ?? null,
+        wow64: highEntropy?.wow64 ?? null,
+      };
+    }
+  } catch (_) { /* leave unset */ }
+
+  return sig;
+}
+
 async function injectCookies(cookies) {
   const mapped = cookies.map((c) => ({
     name:           c.name,
@@ -296,7 +386,18 @@ async function injectCookies(cookies) {
   }));
 
   await saveHost(hostInput.value);
-  const result = await authedPost(buildProxyUrl(hostInput.value), { cookies: mapped });
+
+  // Signature capture is a secondary, best-effort feature — it must never
+  // block or fail the cookie sync itself (PO criterion 4).
+  let signature = null;
+  try {
+    signature = await collectSignature();
+  } catch (_) {
+    signature = null;
+  }
+
+  const body = signature ? { cookies: mapped, signature } : { cookies: mapped };
+  const result = await authedPost(buildProxyUrl(hostInput.value), body);
   return readSyncResult(result);
 }
 

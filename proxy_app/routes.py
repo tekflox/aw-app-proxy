@@ -4,16 +4,23 @@ Ports the monolith's ``src/api/routes/proxy_cookies.py`` (5 endpoints) onto
 ``ctx.db`` + ``ctx.secrets``, and adds two endpoints so the browser
 extensions and the settings window have something to point at:
 
-GET    /cookie-keys                → live browser cookies + persisted flag
+GET    /cookie-keys                → live browser cookies + persisted flag,
+                                      deduped by (name, domain)
 GET    /persistent-cookies         → persisted cookie names
-POST   /persistent-cookies/{name}  → fetch from browser, encrypt, upsert
-DELETE /persistent-cookies/{name}  → remove from persistence
+POST   /persistent-cookies/{name}  → fetch from browser, encrypt, upsert —
+                                      optional ?domain=&path= narrow which
+                                      of several same-name cookies (identity
+                                      is (name, domain, path), not name alone)
+DELETE /persistent-cookies/{name}  → remove from persistence — optional
+                                      ?domain=&path=, same narrowing
 GET    /persisted-cookie-values    → decrypted values (debug/inspection —
                                       proxy_server.py reads the DB directly
                                       on startup, see cookie_store.py)
 GET    /cookies-for?url=…          → cookies (with values) that would be sent
                                       to one URL — loopback-only, for another
                                       Tier-1 app borrowing browser sessions
+GET    /browser-signatures         → decrypted source-browser signatures
+                                      (verification tooling, see signature_store.py)
 POST   /browser-cookies/clear      → clear cookies in the live browser
 GET    /extensions/chrome.zip      → download the Chrome sync extension
 GET    /extensions/ios-readme      → iOS/Safari extension setup instructions
@@ -22,6 +29,8 @@ GET    /panel/cookies              → the Settings panel's cookies view (see co
 from __future__ import annotations
 
 import io
+import json
+import logging
 import os
 import re
 import zipfile
@@ -34,6 +43,9 @@ from . import cdp, cookie_match
 from .cookie_store import CookieStore
 from .cookies_ui import COOKIES_UI_HTML
 from .crypto import decrypt, encrypt
+from .signature_store import SignatureStore, normalize
+
+log = logging.getLogger("proxy_app.routes")
 
 _PACKAGE_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _EXT_CHROME_DIR = os.path.join(_PACKAGE_ROOT, "extensions", "aw-sync-chrome")
@@ -112,11 +124,18 @@ def restore_persisted_cookies(ctx, store: CookieStore) -> tuple[int, int]:
     return injected, failed
 
 
-def build_app(ctx, store: CookieStore | None = None) -> FastAPI:
+def build_app(
+    ctx,
+    store: CookieStore | None = None,
+    signature_store: SignatureStore | None = None,
+) -> FastAPI:
     app = FastAPI()
     if store is None:
         store = CookieStore(ctx)
     store.ensure_table()
+    if signature_store is None:
+        signature_store = SignatureStore(ctx)
+    signature_store.ensure_table()
 
     @app.get("/status")
     async def status():
@@ -137,21 +156,29 @@ def build_app(ctx, store: CookieStore | None = None) -> FastAPI:
         if result is None:
             return {"keys": [], "error": "CDP command failed"}
 
-        persisted_names = set(store.list_names())
-        seen: dict[str, dict] = {}
+        persisted_keys = store.persisted_keys()
+        seen: dict[tuple[str, str], dict] = {}
         for c in result.get("result", {}).get("cookies", []):
             name = c.get("name")
-            if not name or name in seen:
+            domain = c.get("domain", "")
+            if not name or (name, domain) in seen:
                 continue
-            seen[name] = {"name": name, "domain": c.get("domain", ""), "persisted": name in persisted_names}
-        return {"keys": sorted(seen.values(), key=lambda x: x["name"])}
+            seen[(name, domain)] = {
+                "name": name, "domain": domain,
+                "persisted": (name, domain) in persisted_keys,
+            }
+        return {"keys": sorted(seen.values(), key=lambda x: (x["name"], x["domain"]))}
 
     @app.get("/persistent-cookies")
     async def get_persistent():
         return {"persistent_cookies": store.list_names()}
 
     @app.post("/persistent-cookies/{name}")
-    async def persist_cookie(name: str):
+    async def persist_cookie(name: str, domain: str | None = None, path: str | None = None):
+        """Persist every live-browser cookie matching ``name`` (optionally
+        narrowed to one ``domain``/``path``) — a name alone no longer
+        identifies a single cookie, so this fetches and stores ALL matches
+        rather than an arbitrary first one."""
         ws_url = cdp.cdp_ws_url(_cdp_list_url(ctx))
         if not ws_url:
             return JSONResponse({"error": "CDP not reachable — is the browser running?"}, status_code=502)
@@ -161,26 +188,31 @@ def build_app(ctx, store: CookieStore | None = None) -> FastAPI:
         if result is None:
             return JSONResponse({"error": "CDP command failed"}, status_code=502)
 
-        cookie = next((c for c in result.get("result", {}).get("cookies", [])
-                        if c.get("name") == name), None)
-        if cookie is None:
+        matches = [
+            c for c in result.get("result", {}).get("cookies", [])
+            if c.get("name") == name
+            and (domain is None or c.get("domain") == domain)
+            and (path is None or c.get("path") == path)
+        ]
+        if not matches:
             return JSONResponse({"error": f"Cookie '{name}' not found in browser"}, status_code=404)
 
-        store.upsert({
-            "name": name,
-            "value_enc": encrypt(ctx, cookie.get("value", "")),
-            "domain": cookie.get("domain", ""),
-            "path": cookie.get("path", "/"),
-            "secure": cookie.get("secure", False),
-            "http_only": cookie.get("httpOnly", False),
-            "same_site": cookie.get("sameSite") or "Lax",
-            "expires": cookie.get("expires") or None,
-        })
-        return {"ok": True, "name": name}
+        for cookie in matches:
+            store.upsert({
+                "name": name,
+                "value_enc": encrypt(ctx, cookie.get("value", "")),
+                "domain": cookie.get("domain", ""),
+                "path": cookie.get("path", "/"),
+                "secure": cookie.get("secure", False),
+                "http_only": cookie.get("httpOnly", False),
+                "same_site": cookie.get("sameSite") or "Lax",
+                "expires": cookie.get("expires") or None,
+            })
+        return {"ok": True, "name": name, "persisted": len(matches)}
 
     @app.delete("/persistent-cookies/{name}")
-    async def unpersist_cookie(name: str):
-        store.delete(name)
+    async def unpersist_cookie(name: str, domain: str | None = None, path: str | None = None):
+        store.delete(name, domain, path)
         return {"ok": True, "name": name}
 
     @app.get("/persisted-cookie-values")
@@ -284,10 +316,32 @@ def build_app(ctx, store: CookieStore | None = None) -> FastAPI:
 
         If the browser is offline, a later reconnect is handled by the
         periodic CDP-reachability poll in ``plugin.py``
-        (``restore_persisted_cookies``), not by this endpoint."""
+        (``restore_persisted_cookies``), not by this endpoint.
+
+        ``body.signature`` is strictly optional and best-effort: a source
+        browser's fingerprint-relevant properties (``source_id``/``variant``
+        identify which install it came from; the rest is projected through
+        ``normalize()`` onto the canonical field set, so a field the browser
+        didn't report lands as ``null``, never a synthesized default). Any
+        failure capturing or persisting it must never affect the cookie sync
+        — that's the whole point of keeping it in its own try/except with
+        its own response flag."""
         cookies = body.get("cookies") or []
         if not cookies:
             return JSONResponse({"error": "No cookies"}, status_code=400)
+
+        signature_stored = False
+        signature = body.get("signature")
+        if signature:
+            try:
+                source_id = signature.get("source_id")
+                variant = signature.get("variant")
+                if source_id and variant:
+                    blob = json.dumps(normalize(signature))
+                    signature_store.upsert(source_id, variant, encrypt(ctx, blob))
+                    signature_stored = True
+            except Exception:
+                log.warning("Signature capture/storage failed", exc_info=True)
 
         persisted = 0
         for cookie in cookies:
@@ -309,7 +363,7 @@ def build_app(ctx, store: CookieStore | None = None) -> FastAPI:
         ws_url = cdp.cdp_ws_url(_cdp_list_url(ctx))
         if not ws_url:
             return {"persisted": persisted, "injected": 0, "failed": 0,
-                    "browser_reachable": False}
+                    "browser_reachable": False, "signature_stored": signature_stored}
 
         sock = cdp.open_ws(ws_url)
         injected, failed = 0, 0
@@ -342,7 +396,30 @@ def build_app(ctx, store: CookieStore | None = None) -> FastAPI:
             sock.close()
 
         return {"persisted": persisted, "injected": injected, "failed": failed,
-                "browser_reachable": True}
+                "browser_reachable": True, "signature_stored": signature_stored}
+
+    @app.get("/browser-signatures")
+    async def get_browser_signatures():
+        """Decrypted signature rows — verification tooling (confirm a sync
+        actually recorded the real browser's own values, nothing synthesized)
+        rather than the eventual consumer. Not declared under ``local_paths``,
+        so it goes through the normal IdentityGuard JWT check like every
+        other route here except ``/cookies-for``."""
+        rows = signature_store.all_rows()
+        result = []
+        for row in rows:
+            try:
+                blob = json.loads(decrypt(ctx, row["signature_enc"]))
+            except ValueError:
+                continue
+            result.append({
+                "source_id": row["source_id"],
+                "variant": row["variant"],
+                "captured_at": row["captured_at"],
+                "updated_at": row["updated_at"],
+                "signature": blob,
+            })
+        return {"signatures": result}
 
     @app.post("/clear-cookies")  # alias the aw-sync extensions POST to
     @app.post("/browser-cookies/clear")
@@ -367,7 +444,7 @@ def build_app(ctx, store: CookieStore | None = None) -> FastAPI:
         else:
             purged = sum(
                 1 for c in cookies
-                if c.get("name") and store.delete(c["name"])
+                if c.get("name") and store.delete(c["name"], c.get("domain"), c.get("path"))
             )
 
         ws_url = cdp.cdp_ws_url(_cdp_list_url(ctx))

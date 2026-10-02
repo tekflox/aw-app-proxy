@@ -52,7 +52,7 @@ def test_sync_persists_every_cookie_with_browser_offline(client_store):
 
     assert resp.status_code == 200
     assert resp.json() == {"persisted": 2, "injected": 0, "failed": 0,
-                           "browser_reachable": False}
+                           "browser_reachable": False, "signature_stored": False}
     rows = {r["name"]: r for r in store.all_rows()}
     assert set(rows) == {"aw_jwt", "SID"}
     assert decrypt(ctx, rows["aw_jwt"]["value_enc"]) == "v1"

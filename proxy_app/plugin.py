@@ -24,6 +24,7 @@ import sys
 from . import cdp
 from . import routes as routes_mod
 from .cookie_store import CookieStore
+from .signature_store import SignatureStore
 
 log = logging.getLogger("aw_apps.proxy")
 
@@ -52,8 +53,10 @@ class ProxyAppPlugin:
         self.ctx = ctx
         self.store = CookieStore(ctx)
         self.store.ensure_table()
+        self.signature_store = SignatureStore(ctx)
+        self.signature_store.ensure_table()
 
-        subapp = routes_mod.build_app(ctx, self.store)
+        subapp = routes_mod.build_app(ctx, self.store, self.signature_store)
         ctx.routes.register(subapp)
 
         port = int(ctx.config.get("proxy_port") or 9124)

@@ -20,15 +20,16 @@ import time
 TABLE = "app__proxy__persisted_cookies"
 
 COLUMNS_SQL = (
-    "name TEXT PRIMARY KEY, "
+    "name TEXT NOT NULL, "
     "value_enc TEXT NOT NULL, "
-    "domain TEXT DEFAULT '', "
-    "path TEXT DEFAULT '/', "
+    "domain TEXT NOT NULL DEFAULT '', "
+    "path TEXT NOT NULL DEFAULT '/', "
     "secure INTEGER DEFAULT 0, "
     "http_only INTEGER DEFAULT 0, "
     "same_site TEXT DEFAULT 'Lax', "
     "expires DOUBLE PRECISION, "
-    "updated_at DOUBLE PRECISION"
+    "updated_at DOUBLE PRECISION, "
+    "PRIMARY KEY (name, domain, path)"
 )
 
 
@@ -42,8 +43,15 @@ class CookieStore:
         self.ctx.db.create(TABLE, COLUMNS_SQL)
 
     def list_names(self) -> list[str]:
-        rows = self.ctx.db.execute(TABLE, "SELECT name FROM {table} ORDER BY name")
+        rows = self.ctx.db.execute(TABLE, "SELECT DISTINCT name FROM {table} ORDER BY name")
         return [r[0] for r in rows]
+
+    def persisted_keys(self) -> set[tuple[str, str]]:
+        """(name, domain) pairs already persisted — used by routes.py's
+        ``/cookie-keys`` to flag live-browser cookies that still need a
+        push, now that identity is no longer name-only."""
+        rows = self.ctx.db.execute(TABLE, "SELECT DISTINCT name, domain FROM {table}")
+        return {(r[0], r[1]) for r in rows}
 
     def upsert(self, cookie: dict) -> None:
         self.ctx.db.execute(
@@ -51,8 +59,8 @@ class CookieStore:
             "INSERT INTO {table} "
             "(name, value_enc, domain, path, secure, http_only, same_site, expires, updated_at) "
             "VALUES (:name, :value_enc, :domain, :path, :secure, :http_only, :same_site, :expires, :updated_at) "
-            "ON CONFLICT (name) DO UPDATE SET "
-            "value_enc=EXCLUDED.value_enc, domain=EXCLUDED.domain, path=EXCLUDED.path, "
+            "ON CONFLICT (name, domain, path) DO UPDATE SET "
+            "value_enc=EXCLUDED.value_enc, "
             "secure=EXCLUDED.secure, http_only=EXCLUDED.http_only, same_site=EXCLUDED.same_site, "
             "expires=EXCLUDED.expires, updated_at=EXCLUDED.updated_at",
             {
@@ -68,11 +76,22 @@ class CookieStore:
             },
         )
 
-    def delete(self, name: str) -> bool:
-        rows = self.ctx.db.execute(TABLE, "SELECT name FROM {table} WHERE name = :name", {"name": name})
+    def delete(self, name: str, domain: str | None = None, path: str | None = None) -> bool:
+        """Name-only deletes every row with that name (preserves the UI's
+        "Forget" semantic and API back-compat); passing ``domain`` (and
+        optionally ``path``) narrows the delete to that one cookie."""
+        where = "name = :name"
+        params: dict = {"name": name}
+        if domain is not None:
+            where += " AND domain = :domain"
+            params["domain"] = domain
+        if path is not None:
+            where += " AND path = :path"
+            params["path"] = path
+        rows = self.ctx.db.execute(TABLE, f"SELECT name FROM {{table}} WHERE {where}", params)
         if not rows:
             return False
-        self.ctx.db.execute(TABLE, "DELETE FROM {table} WHERE name = :name", {"name": name})
+        self.ctx.db.execute(TABLE, f"DELETE FROM {{table}} WHERE {where}", params)
         return True
 
     def delete_all(self) -> int:
@@ -136,8 +155,8 @@ def upsert_direct(cookie: dict) -> None:
             f"INSERT INTO {qualified} "
             "(name, value_enc, domain, path, secure, http_only, same_site, expires, updated_at) "
             "VALUES (:name, :value_enc, :domain, :path, :secure, :http_only, :same_site, :expires, :updated_at) "
-            "ON CONFLICT (name) DO UPDATE SET "
-            "value_enc=EXCLUDED.value_enc, domain=EXCLUDED.domain, path=EXCLUDED.path, "
+            "ON CONFLICT (name, domain, path) DO UPDATE SET "
+            "value_enc=EXCLUDED.value_enc, "
             "secure=EXCLUDED.secure, http_only=EXCLUDED.http_only, same_site=EXCLUDED.same_site, "
             "expires=EXCLUDED.expires, updated_at=EXCLUDED.updated_at"
         ), {
