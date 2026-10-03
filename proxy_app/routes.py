@@ -4,8 +4,10 @@ Ports the monolith's ``src/api/routes/proxy_cookies.py`` (5 endpoints) onto
 ``ctx.db`` + ``ctx.secrets``, and adds two endpoints so the browser
 extensions and the settings window have something to point at:
 
-GET    /cookie-keys                → live browser cookies + persisted flag,
-                                      deduped by (name, domain)
+GET    /cookie-keys                → persisted cookie keys (always) + live
+                                      browser cookies when CDP is reachable,
+                                      deduped by (name, domain); a non-fatal
+                                      ``error`` note when CDP isn't reachable
 GET    /persistent-cookies         → persisted cookie names
 POST   /persistent-cookies/{name}  → fetch from browser, encrypt, upsert —
                                       optional ?domain=&path= narrow which
@@ -220,27 +222,43 @@ def build_app(
 
     @app.get("/cookie-keys")
     async def get_cookie_keys():
+        """Always starts from the Postgres-backed persisted set — the
+        synced browser being unreachable must never hide cookies that are
+        already durably stored (persistence here isn't optional, see
+        cookies_ui.py). The live browser, when reachable, only ever adds
+        not-yet-persisted (name, domain) pairs on top, flagged
+        ``persisted: false`` so the Settings panel's auto-persist-on-refresh
+        picks them up."""
+        persisted_keys = store.persisted_keys()
+        seen: dict[tuple[str, str], dict] = {
+            key: {"name": key[0], "domain": key[1], "persisted": True}
+            for key in persisted_keys
+        }
+
+        error = None
         ws_url = cdp.cdp_ws_url(_primary_cdp_list_url(ctx))
         if not ws_url:
-            return {"keys": [], "error": "CDP not reachable — is the browser running?"}
-        sock = cdp.open_ws(ws_url)
-        result = cdp.send_recv(sock, 1, "Network.getAllCookies", {})
-        sock.close()
-        if result is None:
-            return {"keys": [], "error": "CDP command failed"}
+            error = "Live browser not reachable — showing persisted cookies only"
+        else:
+            sock = cdp.open_ws(ws_url)
+            result = cdp.send_recv(sock, 1, "Network.getAllCookies", {})
+            sock.close()
+            if result is None:
+                error = "Live browser not reachable — showing persisted cookies only"
+            else:
+                for c in result.get("result", {}).get("cookies", []):
+                    name = c.get("name")
+                    domain = c.get("domain", "")
+                    if not name:
+                        continue
+                    seen.setdefault((name, domain), {
+                        "name": name, "domain": domain, "persisted": False,
+                    })
 
-        persisted_keys = store.persisted_keys()
-        seen: dict[tuple[str, str], dict] = {}
-        for c in result.get("result", {}).get("cookies", []):
-            name = c.get("name")
-            domain = c.get("domain", "")
-            if not name or (name, domain) in seen:
-                continue
-            seen[(name, domain)] = {
-                "name": name, "domain": domain,
-                "persisted": (name, domain) in persisted_keys,
-            }
-        return {"keys": sorted(seen.values(), key=lambda x: (x["name"], x["domain"]))}
+        response = {"keys": sorted(seen.values(), key=lambda x: (x["name"], x["domain"]))}
+        if error:
+            response["error"] = error
+        return response
 
     @app.get("/persistent-cookies")
     async def get_persistent():

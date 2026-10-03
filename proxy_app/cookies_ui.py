@@ -157,9 +157,17 @@ function render() {
 }
 
 async function loadKeys() {
-  const payload = await call('GET', '/cookie-keys');
+  // Not routed through call(): that helper throws on a truthy
+  // payload.error regardless of HTTP status, which would discard
+  // payload.keys before it's ever read. /cookie-keys's error is a
+  // non-blocking banner (e.g. "live browser unreachable") sitting
+  // alongside a perfectly good persisted-cookie list, not a failure.
+  const res = await fetch(BASE + '/cookie-keys', { credentials: 'include' });
+  let payload = {};
+  try { payload = await res.json(); } catch (_e) {}
+  if (!res.ok) throw new Error(payload.error || payload.detail || ('HTTP ' + res.status));
   keys = payload.keys || [];
-  if (payload.error) say(esc(payload.error), 'err');
+  say(payload.error ? esc(payload.error) : '', 'err');
   render();
 }
 
