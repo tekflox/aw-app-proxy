@@ -76,21 +76,94 @@ def _patch_default_host(popup_js_path: str) -> str:
     )
 
 
-def _cdp_list_url(ctx) -> str:
-    return ctx.config.get("browser_cdp_list_url") or cdp.cdp_list_url_default()
+def _cdp_list_urls(ctx) -> list[str]:
+    return cdp.resolve_cdp_list_urls(ctx.config)
 
 
-def restore_persisted_cookies(ctx, store: CookieStore) -> tuple[int, int]:
-    """Inject every persisted cookie into the live browser via CDP,
+def _primary_cdp_list_url(ctx) -> str:
+    """Reads stay pinned to the first configured target (aw-app-browser by
+    default) — the interactive browser is the source of truth for what the
+    user is logged into; fanning reads out would let an automation profile
+    (e.g. Kali's) pollute the persist flow and the Settings panel."""
+    return _cdp_list_urls(ctx)[0]
+
+
+def _inject_cookies_via_cdp(ws_url: str, cookies: list[dict]) -> tuple[int, int]:
+    """One target's worth of ``Network.setCookie`` pushes — shared by
+    ``sync_cookies``' fan-out across every configured CDP target."""
+    sock = cdp.open_ws(ws_url)
+    injected, failed = 0, 0
+    try:
+        for msg_id, cookie in enumerate(cookies, start=1):
+            name = cookie.get("name", "")
+            is_host_prefix = name.startswith("__Host-")
+            is_secure_prefix = name.startswith("__Secure-")
+            same_site = cookie.get("sameSite", "Lax")
+            secure = bool(cookie.get("secure", False)) or is_host_prefix \
+                or is_secure_prefix or same_site == "None"
+            scheme = "https" if secure else "http"
+            domain = cookie.get("domain", "").lstrip(".")
+            params = {
+                "name": name, "value": cookie.get("value", ""),
+                "path": "/" if is_host_prefix else cookie.get("path", "/"),
+                "secure": secure, "httpOnly": cookie.get("httpOnly", False),
+                "sameSite": same_site, "url": f"{scheme}://{domain}/",
+            }
+            if not is_host_prefix:
+                params["domain"] = cookie.get("domain", "")
+            if cookie.get("expirationDate"):
+                params["expires"] = cookie["expirationDate"]
+            result = cdp.send_recv(sock, msg_id, "Network.setCookie", params)
+            if result and result.get("result", {}).get("success"):
+                injected += 1
+            else:
+                failed += 1
+    finally:
+        sock.close()
+    return injected, failed
+
+
+def _clear_cookies_via_cdp(ws_url: str, clear_all: bool, cookies: list[dict]):
+    """One target's worth of clear-cookies work — shared by
+    ``clear_browser_cookies``' fan-out across every configured CDP target."""
+    sock = cdp.open_ws(ws_url)
+    try:
+        if clear_all:
+            result = cdp.send_recv(sock, 1, "Network.clearBrowserCookies", {})
+            return "all" if result is not None else 0
+        cleared = 0
+        for i, c in enumerate(cookies, start=1):
+            name = c.get("name", "")
+            if not name:
+                continue
+            params: dict = {"name": name}
+            if c.get("domain"):
+                params["domain"] = c["domain"]
+                params["path"] = c.get("path", "/")
+            result = cdp.send_recv(sock, i, "Network.deleteCookies", params)
+            if result is not None:
+                cleared += 1
+        return cleared
+    finally:
+        sock.close()
+
+
+def restore_persisted_cookies(ctx, store: CookieStore, target: str | None = None) -> tuple[int, int]:
+    """Inject every persisted cookie into one live browser via CDP,
     best-effort. Shared by the periodic reconnect-loop in ``plugin.py``
     (browser comes back online → catch it up on whatever was persisted
     while it was down) and available for a manual "restore now" call.
+    ``target`` is a single CDP ``/json/list`` URL; the caller fans this out
+    across ``_cdp_list_urls(ctx)`` for multi-target reconciliation (see
+    plugin.py's reconcile loop). Defaults to the primary target for direct
+    callers that don't care about fan-out.
     Returns ``(injected, failed)``; ``(0, 0)`` if there's nothing to do or
     CDP isn't reachable right now."""
+    target = target or _primary_cdp_list_url(ctx)
     rows = store.all_rows()
     if not rows:
         return 0, 0
-    ws_url = cdp.cdp_ws_url(_cdp_list_url(ctx))
+    ws_url = cdp.cdp_ws_url(target)
     if not ws_url:
         return 0, 0
 
@@ -141,13 +214,13 @@ def build_app(
     async def status():
         from .plugin import SERVICE_ID
         svc_status = ctx.services.status(SERVICE_ID)
-        ws_url = cdp.cdp_ws_url(_cdp_list_url(ctx))
+        ws_url = cdp.cdp_ws_url(_primary_cdp_list_url(ctx))
         return {**svc_status, "cdp_reachable": ws_url is not None,
                 "proxy_port": ctx.config.get("proxy_port") or 9124}
 
     @app.get("/cookie-keys")
     async def get_cookie_keys():
-        ws_url = cdp.cdp_ws_url(_cdp_list_url(ctx))
+        ws_url = cdp.cdp_ws_url(_primary_cdp_list_url(ctx))
         if not ws_url:
             return {"keys": [], "error": "CDP not reachable — is the browser running?"}
         sock = cdp.open_ws(ws_url)
@@ -179,7 +252,7 @@ def build_app(
         narrowed to one ``domain``/``path``) — a name alone no longer
         identifies a single cookie, so this fetches and stores ALL matches
         rather than an arbitrary first one."""
-        ws_url = cdp.cdp_ws_url(_cdp_list_url(ctx))
+        ws_url = cdp.cdp_ws_url(_primary_cdp_list_url(ctx))
         if not ws_url:
             return JSONResponse({"error": "CDP not reachable — is the browser running?"}, status_code=502)
         sock = cdp.open_ws(ws_url)
@@ -270,7 +343,7 @@ def build_app(
             return JSONResponse(
                 {"error": "url must be an absolute http(s) URL"}, status_code=400)
 
-        ws_url = cdp.cdp_ws_url(_cdp_list_url(ctx))
+        ws_url = cdp.cdp_ws_url(_primary_cdp_list_url(ctx))
         if ws_url:
             sock = cdp.open_ws(ws_url)
             try:
@@ -360,43 +433,23 @@ def build_app(
             })
             persisted += 1
 
-        ws_url = cdp.cdp_ws_url(_cdp_list_url(ctx))
-        if not ws_url:
-            return {"persisted": persisted, "injected": 0, "failed": 0,
-                    "browser_reachable": False, "signature_stored": signature_stored}
-
-        sock = cdp.open_ws(ws_url)
+        any_reachable = False
         injected, failed = 0, 0
-        try:
-            for msg_id, cookie in enumerate(cookies, start=1):
-                name = cookie.get("name", "")
-                is_host_prefix = name.startswith("__Host-")
-                is_secure_prefix = name.startswith("__Secure-")
-                same_site = cookie.get("sameSite", "Lax")
-                secure = bool(cookie.get("secure", False)) or is_host_prefix \
-                    or is_secure_prefix or same_site == "None"
-                scheme = "https" if secure else "http"
-                domain = cookie.get("domain", "").lstrip(".")
-                params = {
-                    "name": name, "value": cookie.get("value", ""),
-                    "path": "/" if is_host_prefix else cookie.get("path", "/"),
-                    "secure": secure, "httpOnly": cookie.get("httpOnly", False),
-                    "sameSite": same_site, "url": f"{scheme}://{domain}/",
-                }
-                if not is_host_prefix:
-                    params["domain"] = cookie.get("domain", "")
-                if cookie.get("expirationDate"):
-                    params["expires"] = cookie["expirationDate"]
-                result = cdp.send_recv(sock, msg_id, "Network.setCookie", params)
-                if result and result.get("result", {}).get("success"):
-                    injected += 1
-                else:
-                    failed += 1
-        finally:
-            sock.close()
+        for list_url in _cdp_list_urls(ctx):
+            ws_url = cdp.cdp_ws_url(list_url)
+            if not ws_url:
+                continue
+            any_reachable = True
+            try:
+                t_injected, t_failed = _inject_cookies_via_cdp(ws_url, cookies)
+            except Exception:
+                log.warning("Cookie sync: target %s failed", list_url, exc_info=True)
+                continue
+            injected += t_injected
+            failed += t_failed
 
         return {"persisted": persisted, "injected": injected, "failed": failed,
-                "browser_reachable": True, "signature_stored": signature_stored}
+                "browser_reachable": any_reachable, "signature_stored": signature_stored}
 
     @app.get("/browser-signatures")
     async def get_browser_signatures():
@@ -447,34 +500,30 @@ def build_app(
                 if c.get("name") and store.delete(c["name"], c.get("domain"), c.get("path"))
             )
 
-        ws_url = cdp.cdp_ws_url(_cdp_list_url(ctx))
-        if not ws_url:
+        any_reachable = False
+        cleared_all = False
+        cleared_total = 0
+        for list_url in _cdp_list_urls(ctx):
+            ws_url = cdp.cdp_ws_url(list_url)
+            if not ws_url:
+                continue
+            any_reachable = True
+            try:
+                result = _clear_cookies_via_cdp(ws_url, clear_all, cookies)
+            except Exception:
+                log.warning("Cookie clear: target %s failed", list_url, exc_info=True)
+                continue
+            if result == "all":
+                cleared_all = True
+            else:
+                cleared_total += result
+
+        if not any_reachable:
             return {"ok": True, "purged": purged, "cleared": 0,
                     "browser_reachable": False}
 
-        sock = cdp.open_ws(ws_url)
-        try:
-            if clear_all:
-                result = cdp.send_recv(sock, 1, "Network.clearBrowserCookies", {})
-                return {"ok": True, "purged": purged,
-                        "cleared": "all" if result is not None else 0,
-                        "browser_reachable": True}
-
-            cleared = 0
-            for i, c in enumerate(cookies, start=1):
-                name = c.get("name", "")
-                if not name:
-                    continue
-                params: dict = {"name": name}
-                if c.get("domain"):
-                    params["domain"] = c["domain"]
-                    params["path"] = c.get("path", "/")
-                result = cdp.send_recv(sock, i, "Network.deleteCookies", params)
-                if result is not None:
-                    cleared += 1
-        finally:
-            sock.close()
-        return {"ok": True, "purged": purged, "cleared": cleared,
+        return {"ok": True, "purged": purged,
+                "cleared": "all" if cleared_all else cleared_total,
                 "browser_reachable": True}
 
     @app.get("/extensions/chrome.zip")

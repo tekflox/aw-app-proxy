@@ -15,12 +15,35 @@ import urllib.request
 from urllib.parse import urlparse
 
 
+def cdp_list_urls_default() -> list[str]:
+    # Every browser-ish app this proxy pushes cookies into, by container
+    # name on the shared workspace network — 127.0.0.1 here would only ever
+    # be this app's own loopback, not theirs (reconciled 2026-08-02; see
+    # aw-app-browser's aw-app.json dependency note). The real default MUST
+    # live here in code, not only in aw-app.json's config_schema: AppContext
+    # never merges manifest schema defaults into ctx.config (same trap
+    # documented in plugin.py's DEFAULT_ALLOWED_NETWORKS docstring).
+    return [
+        "http://aw-app-browser:9223/json/list",
+        "http://aw-app-kali-linux:9223/json/list",
+    ]
+
+
 def cdp_list_url_default() -> str:
-    # aw-app-browser is a separate Tier-2 (podman) container reachable by
-    # its own name on the shared workspace network — 127.0.0.1 here would
-    # only ever be this app's own loopback, not the browser's (reconciled
-    # 2026-08-02; see aw-app-browser's aw-app.json dependency note).
-    return "http://aw-app-browser:9223/json/list"
+    return cdp_list_urls_default()[0]
+
+
+def resolve_cdp_list_urls(config: dict) -> list[str]:
+    """Effective CDP target list from app config: the plural override wins,
+    else the deprecated singular override (wrapped as one target), else the
+    code default list."""
+    plural = config.get("browser_cdp_list_urls")
+    if plural:
+        return list(plural)
+    singular = config.get("browser_cdp_list_url")
+    if singular:
+        return [singular]
+    return cdp_list_urls_default()
 
 
 def cdp_ws_url(list_url: str, timeout: float = 3.0) -> str | None:

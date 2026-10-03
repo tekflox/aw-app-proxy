@@ -61,12 +61,11 @@ class ProxyAppPlugin:
 
         port = int(ctx.config.get("proxy_port") or 9124)
         allowed_networks = resolve_allowed_networks(ctx.config)
-        from .cdp import cdp_list_url_default
-        cdp_list_url = ctx.config.get("browser_cdp_list_url") or cdp_list_url_default()
+        cdp_list_urls = cdp.resolve_cdp_list_urls(ctx.config)
         start_cmd = (
             f"{sys.executable} -m proxy_app.proxy_server --port {port} "
             f"--allowed-networks {shlex.quote(json.dumps(allowed_networks))} "
-            f"--cdp-list-url {shlex.quote(cdp_list_url)}"
+            f"--cdp-list-urls {shlex.quote(json.dumps(cdp_list_urls))}"
         )
         ctx.services.register(SERVICE_ID, start_cmd, autostart=ctx.config.get("auto_start", True))
 
@@ -90,21 +89,31 @@ class ProxyAppPlugin:
         app: aw-app-browser is a prebuilt Tier-2 container image (own repo,
         own release cadence) — teaching it about this app's HTTP shape
         would be a new cross-app coupling for a problem this app can
-        already solve entirely with the CDP helpers it already has."""
-        was_reachable = False
+        already solve entirely with the CDP helpers it already has.
+
+        Iterates every configured target independently: one target being
+        down (e.g. Kali not installed, or its container stopped) must not
+        skip reconciling the others."""
+        reachable_by_target: dict[str, bool] = {}
         while True:
             try:
                 await asyncio.sleep(RECONNECT_POLL_SECONDS)
-                reachable = cdp.cdp_ws_url(routes_mod._cdp_list_url(self.ctx)) is not None
-                if reachable:
-                    injected, failed = await asyncio.to_thread(
-                        routes_mod.restore_persisted_cookies, self.ctx, self.store)
-                    if injected or failed:
-                        log.info(
-                            "Cookie reconnect: %sreconciled %s persisted cookie(s) (%s failed)",
-                            "browser back online, " if not was_reachable else "",
-                            injected, failed)
-                was_reachable = reachable
+                for target in routes_mod._cdp_list_urls(self.ctx):
+                    was_reachable = reachable_by_target.get(target, False)
+                    try:
+                        reachable = cdp.cdp_ws_url(target) is not None
+                        if reachable:
+                            injected, failed = await asyncio.to_thread(
+                                routes_mod.restore_persisted_cookies, self.ctx, self.store, target)
+                            if injected or failed:
+                                log.info(
+                                    "Cookie reconnect [%s]: %sreconciled %s persisted cookie(s) (%s failed)",
+                                    target, "browser back online, " if not was_reachable else "",
+                                    injected, failed)
+                        reachable_by_target[target] = reachable
+                    except Exception:
+                        log.warning(
+                            "Cookie reconnect: target %s failed this tick", target, exc_info=True)
             except asyncio.CancelledError:
                 raise
             except Exception:

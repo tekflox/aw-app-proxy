@@ -79,10 +79,18 @@
         "default": 9124,
         "description": "TCP port the CONNECT-tunnel / cookie-sync HTTP server listens on. The aw-app-browser container's Chrome must be configured to tunnel through host:this-port."
       },
+      "browser_cdp_list_urls": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "default": ["http://aw-app-browser:9223/json/list", "http://aw-app-kali-linux:9223/json/list"],
+        "description": "CDP /json/list endpoints of every browser this proxy pushes/clears synced cookies into via WebSocket CDP commands (writes fan out to all of them; reads \u2014 /cookie-keys, /cookies-for, persisting a cookie \u2014 stay pinned to the first entry, the interactive browser, as the source of truth). Each is a separate Tier-2 (podman) container reachable by its own name on the shared workspace network. Override only if a target runs under a different app id/network, or to add another browser-ish app."
+      },
       "browser_cdp_list_url": {
         "type": "string",
-        "default": "http://aw-app-browser:9223/json/list",
-        "description": "CDP /json/list endpoint of the browser this proxy injects/clears cookies into via WebSocket CDP commands. aw-app-browser is a separate Tier-2 (podman) container reachable by its own name on the shared workspace network \u2014 override only if your workspace runs the browser under a different app id/network."
+        "default": "",
+        "description": "Deprecated singular override, kept for back-compat with workspaces that set it before browser_cdp_list_urls existed. If set and browser_cdp_list_urls is not, this becomes the one-element effective target list. Prefer browser_cdp_list_urls."
       },
       "allowed_networks": {
         "type": "array",

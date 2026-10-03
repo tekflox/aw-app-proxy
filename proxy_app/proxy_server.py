@@ -17,17 +17,17 @@ differences from the original:
   (same Postgres schema this workspace's own process uses) instead of
   calling back into an HTTP API with a bearer API key.
 
-CDP target (``--cdp-list-url`` / ``AW_PROXY_CDP_LIST_URL``, default
-``cdp.cdp_list_url_default()`` → ``http://aw-app-browser:9223/json/list``):
-reconciled with ``aw-app-browser``'s Tier-2 podman container on 2026-08-02 —
-it is reachable by container name on the shared workspace network, and the
-old ``127.0.0.1:9223`` inherited from ``tools/browser/`` would only ever have
-been this app's own loopback. Still configurable (``browser_cdp_list_url`` in
-app config, which ``plugin.py``/``routes.py`` prefer over the default) so the
-target can move without new code here.
+CDP targets (``--cdp-list-urls`` / ``AW_PROXY_CDP_LIST_URLS``, a JSON list,
+default ``cdp.cdp_list_urls_default()``): writes (sync/clear/restore) fan out
+to every target independently, one unreachable target must not skip the
+others. The deprecated singular ``--cdp-list-url`` / ``AW_PROXY_CDP_LIST_URL``
+is still accepted for one release and becomes a one-element list. Still
+configurable (``browser_cdp_list_urls``/``browser_cdp_list_url`` in app
+config, which ``plugin.py``/``routes.py`` prefer over the default) so targets
+can move without new code here.
 
 Usage:
-    python -m proxy_app.proxy_server [--port 9124] [--cdp-list-url URL]
+    python -m proxy_app.proxy_server [--port 9124] [--cdp-list-urls '["url1","url2"]']
 """
 from __future__ import annotations
 
@@ -54,7 +54,17 @@ log = logging.getLogger("proxy_app.proxy_server")
 DEFAULT_PORT = 9124
 _COOKIE_ENDPOINTS = ("/sync-cookies", "/clear-cookies")
 
-_CDP_LIST_URL = os.environ.get("AW_PROXY_CDP_LIST_URL", cdp.cdp_list_url_default())
+def _env_cdp_list_urls() -> list[str]:
+    plural = os.environ.get("AW_PROXY_CDP_LIST_URLS")
+    if plural:
+        return json.loads(plural)
+    singular = os.environ.get("AW_PROXY_CDP_LIST_URL")
+    if singular:
+        return [singular]
+    return cdp.cdp_list_urls_default()
+
+
+_CDP_LIST_URLS = _env_cdp_list_urls()
 _ALLOWED_NETWORKS = [ipaddress.ip_network(n, strict=False)
                       for n in json.loads(os.environ.get("AW_PROXY_ALLOWED_NETWORKS", '["127.0.0.0/8"]'))]
 _MITM_ENABLED = os.environ.get("AW_PROXY_MITM_DISABLED") != "1"
@@ -134,6 +144,18 @@ def _read_body(rfile, headers):
     return b""
 
 
+def _reachable_targets(list_urls):
+    """Resolve each configured CDP /json/list target to its page websocket
+    URL, dropping any that aren't reachable right now — per-target failure
+    isolation, one down target must not skip the others."""
+    result = []
+    for list_url in list_urls:
+        ws_url = cdp.cdp_ws_url(list_url)
+        if ws_url:
+            result.append((list_url, ws_url))
+    return result
+
+
 def _write_message(sock, start_line, headers, body):
     lines = [start_line]
     for k, v in headers:
@@ -182,6 +204,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
             return
         if self.path == "/clear-cookies":
             self._handle_clear_cookies()
+            return
+        if self.path == "/restore-cookies":
+            self._handle_restore_cookies()
             return
         self._forward_http()
 
@@ -270,12 +295,26 @@ class ProxyHandler(BaseHTTPRequestHandler):
             return
         log.info(f"Cookie sync: received {len(cookies)} cookies")
 
-        ws_url = cdp.cdp_ws_url(_CDP_LIST_URL)
-        if not ws_url:
+        targets = _reachable_targets(_CDP_LIST_URLS)
+        if not targets:
             self.wfile.write(json.dumps({"error": "No CDP page found"}).encode())
             return
-        injected, failed = self._inject_via_cdp(ws_url, cookies)
-        log.info(f"Cookie sync: {injected} injected, {failed} failed")
+
+        injected, failed = 0, 0
+        for list_url, ws_url in targets:
+            try:
+                t_injected, t_failed = self._inject_via_cdp(ws_url, cookies)
+            except Exception:
+                log.warning(f"Cookie sync: target {list_url} failed", exc_info=True)
+                continue
+            injected += t_injected
+            failed += t_failed
+
+        if injected > 0:
+            self._persist_cookies(cookies)
+
+        log.info(f"Cookie sync: {injected} injected, {failed} failed across "
+                 f"{len(targets)}/{len(_CDP_LIST_URLS)} reachable target(s)")
         self.wfile.write(json.dumps({"injected": injected, "failed": failed}).encode())
 
     def _handle_clear_cookies(self):
@@ -302,40 +341,80 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self.wfile.write(json.dumps({"error": "Nothing to clear"}).encode())
             return
 
-        ws_url = cdp.cdp_ws_url(_CDP_LIST_URL)
-        if not ws_url:
+        targets = _reachable_targets(_CDP_LIST_URLS)
+        if not targets:
             self.wfile.write(json.dumps({"error": "No CDP page found"}).encode())
             return
 
+        cleared, failed = 0, 0
+        cleared_all = False
+        for list_url, ws_url in targets:
+            try:
+                t_cleared, t_failed = self._clear_via_cdp(ws_url, clear_all, cookies)
+            except Exception:
+                log.warning(f"Cookie clear: target {list_url} failed", exc_info=True)
+                continue
+            if t_cleared == -1:
+                cleared_all = True
+            else:
+                cleared += t_cleared
+            failed += t_failed
+        cleared_out = -1 if cleared_all else cleared
+        log.info(f"Cookie clear: {cleared_out} cleared, {failed} failed across "
+                 f"{len(targets)}/{len(_CDP_LIST_URLS)} reachable target(s)")
+        self.wfile.write(json.dumps({"cleared": cleared_out, "failed": failed}).encode())
+
+    def _clear_via_cdp(self, ws_url, clear_all, cookies):
+        """One target's worth of clear-cookies work — extracted so
+        ``_handle_clear_cookies`` can fan it out across every configured
+        target. Preserves the legacy ``-1`` "all cleared" sentinel."""
         sock = cdp.open_ws(ws_url)
         cleared, failed = 0, 0
-        if clear_all:
-            result = cdp.send_recv(sock, 1, "Network.clearBrowserCookies", {})
-            cleared = -1 if result and "result" in result and "error" not in result else 0
-            failed = 0 if cleared == -1 else 1
-        else:
-            for i, c in enumerate(cookies, start=1):
-                name = c.get("name", "")
-                if not name:
-                    failed += 1
-                    continue
-                params = {"name": name}
-                if c.get("domain"):
-                    params["domain"] = c["domain"]
-                    params["path"] = c.get("path", "/")
-                elif c.get("url"):
-                    params["url"] = c["url"]
-                else:
-                    failed += 1
-                    continue
-                result = cdp.send_recv(sock, i, "Network.deleteCookies", params)
-                if result and "error" not in result:
-                    cleared += 1
-                else:
-                    failed += 1
-        sock.close()
-        log.info(f"Cookie clear: {cleared} cleared, {failed} failed")
-        self.wfile.write(json.dumps({"cleared": cleared, "failed": failed}).encode())
+        try:
+            if clear_all:
+                result = cdp.send_recv(sock, 1, "Network.clearBrowserCookies", {})
+                cleared = -1 if result and "result" in result and "error" not in result else 0
+                failed = 0 if cleared == -1 else 1
+            else:
+                for i, c in enumerate(cookies, start=1):
+                    name = c.get("name", "")
+                    if not name:
+                        failed += 1
+                        continue
+                    params = {"name": name}
+                    if c.get("domain"):
+                        params["domain"] = c["domain"]
+                        params["path"] = c.get("path", "/")
+                    elif c.get("url"):
+                        params["url"] = c["url"]
+                    else:
+                        failed += 1
+                        continue
+                    result = cdp.send_recv(sock, i, "Network.deleteCookies", params)
+                    if result and "error" not in result:
+                        cleared += 1
+                    else:
+                        failed += 1
+        finally:
+            sock.close()
+        return cleared, failed
+
+    def _handle_restore_cookies(self):
+        """Trigger-only re-push of every persisted cookie into every
+        configured CDP target. CIDR gate only (same as the CONNECT tunnel)
+        — it returns no cookie data and ``Network.setCookie`` is idempotent,
+        so a re-push from an already-up-to-date caller is harmless. Closes
+        the lazy-launch gap: Kali's ``chromium-aw`` backgrounds a one-shot
+        that calls this right after its Chromium comes up, instead of
+        waiting for the next reconcile-loop tick."""
+        if not self._check_allowed():
+            self.connection.close()
+            return
+        summary = _restore_cookies()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps(summary).encode())
 
     def _inject_via_cdp(self, ws_url, cookies):
         injected, failed = 0, 0
@@ -369,8 +448,6 @@ class ProxyHandler(BaseHTTPRequestHandler):
         except Exception as e:
             log.error(f"Cookie injection failed: {e}")
 
-        if injected > 0:
-            self._persist_cookies(cookies)
         return injected, failed
 
     def _persist_cookies(self, cookies):
@@ -613,26 +690,13 @@ class ThreadPoolHTTPServer(HTTPServer):
             self._pool.shutdown(wait=False)
 
 
-def _restore_cookies() -> None:
-    """On startup: re-inject persisted cookies from the DB into the browser.
-    Never deletes anything from the browser — only re-applies the persisted set."""
-    from .cookie_store import read_persisted_values_direct
-
-    key = _fernet_key()
-    if key is None:
-        return
-    rows = read_persisted_values_direct()
-    if not rows:
-        return
-
+def _restore_cookies_into(ws_url: str, rows, key: bytes) -> int:
+    """Inject every persisted row into one CDP target. Returns the count
+    injected."""
     from .crypto import decrypt_direct
 
-    ws_url = cdp.cdp_ws_url(_CDP_LIST_URL, timeout=3.0)
-    if not ws_url:
-        return
-
+    sock = cdp.open_ws(ws_url)
     try:
-        sock = cdp.open_ws(ws_url)
         msg_id = 1
         injected = 0
         for row in rows:
@@ -652,34 +716,75 @@ def _restore_cookies() -> None:
             cdp.send_recv(sock, msg_id, "Network.setCookie", params)
             msg_id += 1
             injected += 1
+        return injected
+    finally:
         sock.close()
-        if injected:
-            log.info(f"Startup: injected {injected} persisted cookies from DB")
-    except Exception:
-        log.warning("Startup cookie restore failed", exc_info=True)
+
+
+def _restore_cookies() -> dict:
+    """Re-inject persisted cookies from the DB into every reachable CDP
+    target, independently — one unreachable/failing target must not skip
+    the others. Never deletes anything — only re-applies the persisted set.
+    Called at startup and by the trigger-only ``POST /restore-cookies``
+    (closes the lazy-launch gap: ``@playwright/mcp`` only starts Chromium on
+    its first tool call, so without a trigger the first navigation could run
+    up to the reconcile loop's poll interval before cookies catch up)."""
+    from .cookie_store import read_persisted_values_direct
+
+    key = _fernet_key()
+    if key is None:
+        return {"targets": len(_CDP_LIST_URLS), "reachable": 0, "injected": 0}
+    rows = read_persisted_values_direct()
+    if not rows:
+        return {"targets": len(_CDP_LIST_URLS), "reachable": 0, "injected": 0}
+
+    reachable, total_injected = 0, 0
+    for list_url in _CDP_LIST_URLS:
+        ws_url = cdp.cdp_ws_url(list_url, timeout=3.0)
+        if not ws_url:
+            continue
+        reachable += 1
+        try:
+            injected = _restore_cookies_into(ws_url, rows, key)
+            total_injected += injected
+            if injected:
+                log.info(f"Restore [{list_url}]: injected {injected} persisted cookie(s)")
+        except Exception:
+            log.warning(f"Cookie restore failed for target {list_url}", exc_info=True)
+
+    return {"targets": len(_CDP_LIST_URLS), "reachable": reachable, "injected": total_injected}
 
 
 def main():
     parser = argparse.ArgumentParser(description="aw-app-proxy cookie proxy")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--bind", default="0.0.0.0")
-    parser.add_argument("--cdp-list-url", default=None)
+    parser.add_argument("--cdp-list-urls", default=None,
+                         help="JSON list of CDP /json/list URLs to push cookies into")
+    parser.add_argument("--cdp-list-url", default=None,
+                         help="Deprecated singular override — one CDP /json/list URL. "
+                              "Prefer --cdp-list-urls; accepted for one release.")
     parser.add_argument("--allowed-networks", default=None,
                          help="JSON list of CIDR ranges allowed to use the CONNECT tunnel "
                               "(overrides AW_PROXY_ALLOWED_NETWORKS)")
     args = parser.parse_args()
 
-    global _CDP_LIST_URL, _ALLOWED_NETWORKS
-    if args.cdp_list_url:
-        _CDP_LIST_URL = args.cdp_list_url
+    global _CDP_LIST_URLS, _ALLOWED_NETWORKS
+    if args.cdp_list_urls:
+        _CDP_LIST_URLS = json.loads(args.cdp_list_urls)
+    elif args.cdp_list_url:
+        _CDP_LIST_URLS = [args.cdp_list_url]
     if args.allowed_networks:
         _ALLOWED_NETWORKS = [ipaddress.ip_network(n, strict=False)
                               for n in json.loads(args.allowed_networks)]
 
-    _restore_cookies()
+    summary = _restore_cookies()
+    if summary["injected"]:
+        log.info(f"Startup: restored {summary['injected']} cookie(s) across "
+                 f"{summary['reachable']}/{summary['targets']} reachable target(s)")
 
     server = ThreadPoolHTTPServer((args.bind, args.port), ProxyHandler, max_workers=128)
-    log.info(f"Proxy listening on {args.bind}:{args.port}, CDP target {_CDP_LIST_URL}")
+    log.info(f"Proxy listening on {args.bind}:{args.port}, CDP targets {_CDP_LIST_URLS}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

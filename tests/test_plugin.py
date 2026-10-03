@@ -38,14 +38,17 @@ def test_reconnect_loop_reconciles_on_every_tick_not_only_on_reachability_edge(m
     (cleared/evicted in-browser, or by another CDP client) was never
     reconciled. With the browser reachable across two consecutive ticks and
     no transition in between, restore_persisted_cookies must still fire on
-    both — not just the first."""
+    both — not just the first. Pinned to a single target here (see the
+    sibling multi-target test below) so the tick count isn't entangled with
+    the number of configured CDP targets."""
     monkeypatch.setattr(plugin, "RECONNECT_POLL_SECONDS", 0)
     monkeypatch.setattr(cdp, "cdp_ws_url", lambda _url: "ws://fake")
+    monkeypatch.setattr(routes_mod, "_cdp_list_urls", lambda _ctx: ["http://fake-target/json/list"])
 
     calls = []
     monkeypatch.setattr(
         routes_mod, "restore_persisted_cookies",
-        lambda ctx, store: (calls.append(1), (1, 0))[1])
+        lambda ctx, store, target=None: (calls.append(1), (1, 0))[1])
 
     app_plugin = plugin.ProxyAppPlugin()
     app_plugin.ctx = FakeCtx()
@@ -64,3 +67,37 @@ def test_reconnect_loop_reconciles_on_every_tick_not_only_on_reachability_edge(m
     asyncio.run(asyncio.wait_for(run_until_two_ticks(), timeout=5))
 
     assert len(calls) >= 2
+
+
+def test_reconnect_loop_iterates_targets_independently(monkeypatch):
+    """One target being unreachable (e.g. Kali not installed, or stopped)
+    must not block reconciling the others — the multi-target fan-out this
+    loop gained for the Kali cookie-sync ADR."""
+    monkeypatch.setattr(plugin, "RECONNECT_POLL_SECONDS", 0)
+    up, down = "http://up/json/list", "http://down/json/list"
+    monkeypatch.setattr(routes_mod, "_cdp_list_urls", lambda _ctx: [up, down])
+    monkeypatch.setattr(cdp, "cdp_ws_url", lambda url: "ws://fake" if url == up else None)
+
+    calls = []
+    monkeypatch.setattr(
+        routes_mod, "restore_persisted_cookies",
+        lambda ctx, store, target=None: (calls.append(target), (1, 0))[1])
+
+    app_plugin = plugin.ProxyAppPlugin()
+    app_plugin.ctx = FakeCtx()
+    app_plugin.store = CookieStore(app_plugin.ctx)
+
+    async def run_a_few_ticks():
+        task = asyncio.create_task(app_plugin._cookie_reconnect_loop())
+        try:
+            while len(calls) < 3:
+                await asyncio.sleep(0)
+        finally:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+    asyncio.run(asyncio.wait_for(run_a_few_ticks(), timeout=5))
+
+    assert calls
+    assert set(calls) == {up}  # the unreachable target never got a restore call
