@@ -2,7 +2,7 @@
   "manifest_version": 1,
   "id": "proxy",
   "name": "Proxy",
-  "version": "0.15.0",
+  "version": "0.16.0",
   "description": "Browser cookie proxy: an HTTP CONNECT proxy the AW Browser tunnels through, plus the cookie-sync API (/sync-cookies, /clear-cookies) that the aw-sync browser extensions (Chrome + iOS/Safari) push the user's real-browser cookies through, and encrypted persistence of chosen cookies in Postgres so they survive a proxy restart. aw-app-browser depends on this app for authentication.",
   "tier": "inprocess",
   "category": "Service",
@@ -84,7 +84,10 @@
         "items": {
           "type": "string"
         },
-        "default": ["http://aw-app-browser:9223/json/list", "http://aw-app-kali-linux:9223/json/list"],
+        "default": [
+          "http://aw-app-browser:9223/json/list",
+          "http://aw-app-kali-linux:9223/json/list"
+        ],
         "description": "CDP /json/list endpoints of every browser this proxy pushes/clears synced cookies into via WebSocket CDP commands (writes fan out to all of them; reads \u2014 /cookie-keys, /cookies-for, persisting a cookie \u2014 stay pinned to the first entry, the interactive browser, as the source of truth). Each is a separate Tier-2 (podman) container reachable by its own name on the shared workspace network. Override only if a target runs under a different app id/network, or to add another browser-ish app."
       },
       "browser_cdp_list_url": {
