@@ -94,4 +94,4 @@ def test_restore_is_a_noop_when_browser_offline(client_store):
     reports nothing done and waits for the next poll."""
     _client, ctx, store = client_store
     store.upsert({"name": "aw_jwt", "value_enc": "enc", "domain": ".google.com"})
-    assert routes.restore_persisted_cookies(ctx, store) == (0, 0)
+    assert routes.restore_persisted_cookies(ctx, store) == routes.ReconcileResult()

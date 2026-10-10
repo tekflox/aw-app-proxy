@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import sqlite3
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -150,3 +151,68 @@ def test_decrypt_wrong_key_raises(ctx):
     other_ctx = FakeCtx()  # fresh ctx -> fresh (different) key on first use
     with pytest.raises(ValueError):
         decrypt(other_ctx, token)
+
+
+def test_get_or_create_key_refuses_to_regenerate_when_rows_exist_and_key_missing(ctx):
+    """The root-cause guard: a transient secrets-store glitch (key read
+    comes back empty) must never silently manufacture a replacement key
+    while real rows already exist — that would orphan every one of them
+    behind an unrecoverable decrypt failure, the same way the 2026-09-02
+    rotation did."""
+    store = CookieStore(ctx)
+    store.ensure_table()
+    store.upsert({"name": "sid", "value_enc": "already-encrypted-blob", "domain": "example.com"})
+
+    assert ctx.secrets.read("cookie_encryption_key") is None  # never created yet
+    with pytest.raises(RuntimeError):
+        encrypt(ctx, "new-value")
+
+
+def test_get_or_create_key_regenerates_fine_on_a_genuinely_fresh_install(ctx):
+    store = CookieStore(ctx)
+    store.ensure_table()  # table exists but is empty — real first run
+    token = encrypt(ctx, "value")
+    assert decrypt(ctx, token) == "value"
+
+
+def test_upsert_resets_quarantine_fields_on_conflict(store):
+    store.upsert({"name": "aw_jwt", "value_enc": "enc1", "domain": "d1", "path": "/"})
+    store.quarantine("aw_jwt", "d1", "/", "decrypt: key mismatch — row predates key rotation")
+    row = store.all_rows()[0]
+    assert row["quarantined_at"] is not None
+    assert row["quarantine_reason"] is not None
+
+    # A fresh extension sync is a new value and gets a fresh chance.
+    store.upsert({"name": "aw_jwt", "value_enc": "enc2", "domain": "d1", "path": "/"})
+    row = store.all_rows()[0]
+    assert row["quarantined_at"] is None
+    assert row["quarantine_reason"] is None
+    assert row["fail_streak"] == 0
+
+
+def test_bump_fail_streak_increments_and_returns_new_value(store):
+    store.upsert({"name": "tk_lr", "value_enc": "enc", "domain": "d1", "path": "/"})
+    assert store.bump_fail_streak("tk_lr", "d1", "/") == 1
+    assert store.bump_fail_streak("tk_lr", "d1", "/") == 2
+    assert store.all_rows()[0]["fail_streak"] == 2
+
+
+def test_delete_expired_removes_only_rows_past_expiry_plus_grace(store):
+    store.upsert({"name": "dead", "value_enc": "enc", "domain": "d1",
+                  "expires": time.time() - 90000})
+    store.upsert({"name": "fresh", "value_enc": "enc", "domain": "d1",
+                  "expires": time.time() + 3600})
+    store.upsert({"name": "session", "value_enc": "enc", "domain": "d1"})  # expires IS NULL
+
+    removed = store.delete_expired()
+
+    assert removed == 1
+    assert {r["name"] for r in store.all_rows()} == {"fresh", "session"}
+
+
+def test_counts_reports_active_and_quarantined(store):
+    store.upsert({"name": "a", "value_enc": "enc", "domain": "d1", "path": "/"})
+    store.upsert({"name": "b", "value_enc": "enc", "domain": "d1", "path": "/x"})
+    store.quarantine("b", "d1", "/x", "cdp: rejected")
+
+    assert store.counts() == {"active": 1, "quarantined": 1}

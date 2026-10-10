@@ -48,7 +48,7 @@ def test_reconnect_loop_reconciles_on_every_tick_not_only_on_reachability_edge(m
     calls = []
     monkeypatch.setattr(
         routes_mod, "restore_persisted_cookies",
-        lambda ctx, store, target=None: (calls.append(1), (1, 0))[1])
+        lambda ctx, store, target=None: (calls.append(1), routes_mod.ReconcileResult(injected=1))[1])
 
     app_plugin = plugin.ProxyAppPlugin()
     app_plugin.ctx = FakeCtx()
@@ -81,7 +81,7 @@ def test_reconnect_loop_iterates_targets_independently(monkeypatch):
     calls = []
     monkeypatch.setattr(
         routes_mod, "restore_persisted_cookies",
-        lambda ctx, store, target=None: (calls.append(target), (1, 0))[1])
+        lambda ctx, store, target=None: (calls.append(target), routes_mod.ReconcileResult(injected=1))[1])
 
     app_plugin = plugin.ProxyAppPlugin()
     app_plugin.ctx = FakeCtx()
@@ -101,3 +101,116 @@ def test_reconnect_loop_iterates_targets_independently(monkeypatch):
 
     assert calls
     assert set(calls) == {up}  # the unreachable target never got a restore call
+
+
+def _run_ticks(app_plugin, calls, n, timeout=5):
+    """Runs the reconnect loop until tick ``n`` has fully completed —
+    including its post-``restore_persisted_cookies`` logging, which happens
+    synchronously in the loop's own task AFTER ``to_thread`` hands back
+    control. ``restore_persisted_cookies`` itself runs in a worker thread,
+    so ``calls.append()`` inside it can observably reach length ``n`` before
+    the loop task gets scheduled to run tick ``n``'s logging — waiting one
+    further call in guarantees tick ``n`` is done, not just started."""
+    async def _run():
+        task = asyncio.create_task(app_plugin._cookie_reconnect_loop())
+        try:
+            while len(calls) <= n:
+                await asyncio.sleep(0)
+        finally:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+    asyncio.run(asyncio.wait_for(_run(), timeout=timeout))
+
+
+def test_reconnect_loop_logs_warning_when_cookies_get_quarantined(monkeypatch, caplog):
+    monkeypatch.setattr(plugin, "RECONNECT_POLL_SECONDS", 0)
+    monkeypatch.setattr(cdp, "cdp_ws_url", lambda _url: "ws://fake")
+    monkeypatch.setattr(routes_mod, "_cdp_list_urls", lambda _ctx: ["http://fake-target/json/list"])
+
+    calls = []
+
+    def fake_restore(ctx, store, target=None):
+        calls.append(1)
+        return routes_mod.ReconcileResult(
+            injected=1, decrypt_dead=1,
+            quarantined=[{"name": "myacinfo", "domain": ".apple.com",
+                          "reason": "decrypt: key mismatch — row predates key rotation"}])
+
+    monkeypatch.setattr(routes_mod, "restore_persisted_cookies", fake_restore)
+
+    app_plugin = plugin.ProxyAppPlugin()
+    app_plugin.ctx = FakeCtx()
+    app_plugin.store = CookieStore(app_plugin.ctx)
+
+    with caplog.at_level("WARNING", logger="aw_apps.proxy"):
+        _run_ticks(app_plugin, calls, 1)
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert any("myacinfo@.apple.com" in w and "quarantining" in w for w in warnings)
+
+
+def test_reconnect_loop_logs_info_only_when_summary_changes(monkeypatch, caplog):
+    """Regression for the original symptom on this card: steady state
+    (identical injected/rejected/transport_failed tick after tick) must go
+    quiet — only a count CHANGE (or an unreachable->reachable edge) earns
+    an INFO line; an unchanged tick is DEBUG."""
+    monkeypatch.setattr(plugin, "RECONNECT_POLL_SECONDS", 0)
+    monkeypatch.setattr(cdp, "cdp_ws_url", lambda _url: "ws://fake")
+    monkeypatch.setattr(routes_mod, "_cdp_list_urls", lambda _ctx: ["http://fake-target/json/list"])
+
+    results = [
+        routes_mod.ReconcileResult(injected=1),
+        routes_mod.ReconcileResult(injected=1),  # unchanged vs previous tick -> DEBUG
+        routes_mod.ReconcileResult(injected=2),  # changed again -> INFO
+        routes_mod.ReconcileResult(injected=2),  # unchanged vs tick 3 -> DEBUG (completes tick 4's wait)
+    ]
+    calls = []
+
+    def fake_restore(ctx, store, target=None):
+        calls.append(1)
+        return results[len(calls) - 1]
+
+    monkeypatch.setattr(routes_mod, "restore_persisted_cookies", fake_restore)
+
+    app_plugin = plugin.ProxyAppPlugin()
+    app_plugin.ctx = FakeCtx()
+    app_plugin.store = CookieStore(app_plugin.ctx)
+
+    with caplog.at_level("DEBUG", logger="aw_apps.proxy"):
+        _run_ticks(app_plugin, calls, 3)
+
+    info_lines = [r.getMessage() for r in caplog.records
+                  if r.levelname == "INFO" and "reconciled" in r.getMessage()]
+    debug_lines = [r.getMessage() for r in caplog.records
+                   if r.levelname == "DEBUG" and "reconciled" in r.getMessage()]
+    # Exactly 2 INFOs (tick 1 first-ever, tick 3 count-changed) is a stable
+    # assertion. Tick 4's own DEBUG line (unchanged vs tick 3) is only
+    # guaranteed to have STARTED by the time _run_ticks returns, not
+    # necessarily finished logging — so its presence isn't asserted on,
+    # only that tick 2's DEBUG line (guaranteed complete) is there.
+    assert len(info_lines) == 2
+    assert len(debug_lines) >= 1
+
+
+def test_reconnect_loop_logs_one_warning_when_transport_failures_turn_chronic(monkeypatch, caplog):
+    monkeypatch.setattr(plugin, "RECONNECT_POLL_SECONDS", 0)
+    monkeypatch.setattr(cdp, "cdp_ws_url", lambda _url: "ws://fake")
+    monkeypatch.setattr(routes_mod, "_cdp_list_urls", lambda _ctx: ["http://fake-target/json/list"])
+
+    calls = []
+    monkeypatch.setattr(
+        routes_mod, "restore_persisted_cookies",
+        lambda ctx, store, target=None: (calls.append(1), routes_mod.ReconcileResult(transport_failed=1))[1])
+
+    app_plugin = plugin.ProxyAppPlugin()
+    app_plugin.ctx = FakeCtx()
+    app_plugin.store = CookieStore(app_plugin.ctx)
+
+    with caplog.at_level("WARNING", logger="aw_apps.proxy"):
+        _run_ticks(app_plugin, calls, 5)
+
+    chronic_warnings = [r for r in caplog.records
+                        if r.levelname == "WARNING" and "chronic" in r.getMessage()]
+    assert len(chronic_warnings) == 1

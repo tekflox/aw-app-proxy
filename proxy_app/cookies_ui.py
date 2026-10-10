@@ -70,6 +70,7 @@ COOKIES_UI_HTML = """<!doctype html>
   .badge { font-size: 10px; padding: 2px 6px; border-radius: 5px; flex: none;
            background: rgba(74,222,128,.15); color: #4ade80; font-weight: 600; }
   .badge.pending { background: rgba(128,128,128,.15); color: var(--muted); }
+  .badge.quarantined { background: rgba(248,113,113,.15); color: #f87171; }
 
   button { font: inherit; font-size: 11px; font-weight: 500; padding: 4px 10px;
            border-radius: 6px; border: 1px solid var(--line);
@@ -144,12 +145,21 @@ function render() {
 
   $('list').innerHTML = filtered.map((k) => {
     const isBusy = busy === keyOf(k);
+    let badge;
+    if (k.quarantined) {
+      badge = '<span class="badge quarantined" title="' + esc(k.reason || '') + '">quarantined</span>';
+    } else if (k.persisted) {
+      badge = '<span class="badge">DB</span>';
+    } else {
+      badge = '<span class="badge pending">persisting\\u2026</span>';
+    }
     return '<div class="card">'
       + '<div class="name-wrap">'
       +   '<span class="name" title="' + esc(k.name) + '">' + esc(k.name) + '</span>'
       +   (k.domain ? '<span class="domain">' + esc(k.domain) + '</span>' : '')
+      +   (k.quarantined ? '<span class="domain">' + esc(k.reason || '') + '</span>' : '')
       + '</div>'
-      + (k.persisted ? '<span class="badge">DB</span>' : '<span class="badge pending">persisting\\u2026</span>')
+      + badge
       + '<button class="danger" data-forget="' + esc(k.name) + '" data-domain="' + esc(k.domain) + '" '
       +   (isBusy ? 'disabled' : '') + '>Forget</button>'
       + '</div>';

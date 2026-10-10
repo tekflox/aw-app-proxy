@@ -36,6 +36,7 @@ import logging
 import os
 import re
 import zipfile
+from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
 from fastapi import Body, FastAPI
@@ -150,34 +151,84 @@ def _clear_cookies_via_cdp(ws_url: str, clear_all: bool, cookies: list[dict]):
         sock.close()
 
 
-def restore_persisted_cookies(ctx, store: CookieStore, target: str | None = None) -> tuple[int, int]:
-    """Inject every persisted cookie into one live browser via CDP,
-    best-effort. Shared by the periodic reconnect-loop in ``plugin.py``
-    (browser comes back online → catch it up on whatever was persisted
-    while it was down) and available for a manual "restore now" call.
-    ``target`` is a single CDP ``/json/list`` URL; the caller fans this out
-    across ``_cdp_list_urls(ctx)`` for multi-target reconciliation (see
-    plugin.py's reconcile loop). Defaults to the primary target for direct
-    callers that don't care about fan-out.
-    Returns ``(injected, failed)``; ``(0, 0)`` if there's nothing to do or
-    CDP isn't reachable right now."""
+@dataclass
+class ReconcileResult:
+    """Structured outcome of one ``restore_persisted_cookies`` pass —
+    replaces the old ``(injected, failed)`` tuple, which lumped three very
+    different failure modes (a dead key, a structurally-rejected cookie, a
+    transient CDP hiccup) into one undifferentiated count.
+
+    ``quarantined`` lists only the rows THIS pass newly quarantined (name,
+    domain, reason) — empty on a non-primary target's pass, since only the
+    primary target's pass ever writes quarantine (see
+    ``restore_persisted_cookies``)."""
+
+    injected: int = 0
+    decrypt_dead: int = 0
+    rejected: int = 0
+    transport_failed: int = 0
+    quarantined: list[dict] = field(default_factory=list)
+
+
+_REJECTED_STREAK_THRESHOLD = 3
+_DECRYPT_DEAD_REASON = "decrypt: key mismatch — row predates key rotation"
+
+
+def _rejected_reason(row: dict) -> str:
+    same_site = (row.get("same_site") or "").lower()
+    if same_site == "none" and not row.get("secure"):
+        return ("cdp: rejected — SameSite=None requires Secure "
+                "(Chromium structurally rejects this combination)")
+    return "cdp: rejected"
+
+
+def restore_persisted_cookies(ctx, store: CookieStore, target: str | None = None) -> ReconcileResult:
+    """Inject every active (non-quarantined) persisted cookie into one live
+    browser via CDP, best-effort. Shared by the periodic reconnect-loop in
+    ``plugin.py`` (browser comes back online → catch it up on whatever was
+    persisted while it was down) and available for a manual "restore now"
+    call. ``target`` is a single CDP ``/json/list`` URL; the caller fans
+    this out across ``_cdp_list_urls(ctx)`` for multi-target reconciliation
+    (see plugin.py's reconcile loop). Defaults to the primary target for
+    direct callers that don't care about fan-out.
+
+    Quarantine bookkeeping (writing ``quarantined_at``/``fail_streak``,
+    hard-deleting truly-expired rows) only ever happens from the PRIMARY
+    target's pass (``target == _cdp_list_urls(ctx)[0]``, aw-app-browser by
+    default) — a secondary target (e.g. Kali) reconciles against the same
+    active-row filter but never writes, so two targets reconciling the same
+    tick can't double-count a rejection streak.
+
+    Returns a :class:`ReconcileResult`; all-zero/empty if there's nothing to
+    do or CDP isn't reachable right now."""
+    all_targets = _cdp_list_urls(ctx)
     target = target or _primary_cdp_list_url(ctx)
-    rows = store.all_rows()
+    is_primary = not all_targets or target == all_targets[0]
+
+    if is_primary:
+        store.delete_expired()
+
+    result = ReconcileResult()
+    rows = store.all_rows(include_quarantined=False)
     if not rows:
-        return 0, 0
+        return result
     ws_url = cdp.cdp_ws_url(target)
     if not ws_url:
-        return 0, 0
+        return result
 
     sock = cdp.open_ws(ws_url)
-    injected, failed = 0, 0
     try:
         for msg_id, row in enumerate(rows, start=1):
             try:
                 value = decrypt(ctx, row["value_enc"])
             except ValueError:
-                failed += 1
+                result.decrypt_dead += 1
+                if is_primary:
+                    store.quarantine(row["name"], row["domain"], row["path"], _DECRYPT_DEAD_REASON)
+                    result.quarantined.append(
+                        {"name": row["name"], "domain": row["domain"], "reason": _DECRYPT_DEAD_REASON})
                 continue
+
             secure = bool(row["secure"])
             scheme = "https" if secure else "http"
             domain = (row["domain"] or "").lstrip(".")
@@ -189,14 +240,29 @@ def restore_persisted_cookies(ctx, store: CookieStore, target: str | None = None
             }
             if row["expires"]:
                 params["expires"] = row["expires"]
-            result = cdp.send_recv(sock, msg_id, "Network.setCookie", params)
-            if result and result.get("result", {}).get("success"):
-                injected += 1
-            else:
-                failed += 1
+            cdp_result = cdp.send_recv(sock, msg_id, "Network.setCookie", params)
+
+            if cdp_result is None:
+                # Transport hiccup, not a cookie-level verdict — never
+                # written to the DB, never counts toward quarantine.
+                result.transport_failed += 1
+                continue
+
+            if cdp_result.get("result", {}).get("success"):
+                result.injected += 1
+                continue
+
+            result.rejected += 1
+            if is_primary:
+                streak = store.bump_fail_streak(row["name"], row["domain"], row["path"])
+                if streak >= _REJECTED_STREAK_THRESHOLD:
+                    reason = _rejected_reason(row)
+                    store.quarantine(row["name"], row["domain"], row["path"], reason)
+                    result.quarantined.append(
+                        {"name": row["name"], "domain": row["domain"], "reason": reason})
     finally:
         sock.close()
-    return injected, failed
+    return result
 
 
 def build_app(
@@ -218,7 +284,8 @@ def build_app(
         svc_status = ctx.services.status(SERVICE_ID)
         ws_url = cdp.cdp_ws_url(_primary_cdp_list_url(ctx))
         return {**svc_status, "cdp_reachable": ws_url is not None,
-                "proxy_port": ctx.config.get("proxy_port") or 9124}
+                "proxy_port": ctx.config.get("proxy_port") or 9124,
+                "persisted_cookies": store.counts()}
 
     @app.get("/cookie-keys")
     async def get_cookie_keys():
@@ -228,12 +295,18 @@ def build_app(
         cookies_ui.py). The live browser, when reachable, only ever adds
         not-yet-persisted (name, domain) pairs on top, flagged
         ``persisted: false`` so the Settings panel's auto-persist-on-refresh
-        picks them up."""
-        persisted_keys = store.persisted_keys()
-        seen: dict[tuple[str, str], dict] = {
-            key: {"name": key[0], "domain": key[1], "persisted": True}
-            for key in persisted_keys
-        }
+        picks them up.
+
+        Quarantined rows stay in this list (never hidden) with an extra
+        ``quarantined``/``reason`` pair — a dead cookie must stay visible to
+        the Settings panel rather than silently vanish."""
+        seen: dict[tuple[str, str], dict] = {}
+        for row in store.all_rows():
+            key = (row["name"], row["domain"])
+            entry = seen.setdefault(key, {"name": row["name"], "domain": row["domain"], "persisted": True})
+            if row["quarantined_at"]:
+                entry["quarantined"] = True
+                entry["reason"] = row["quarantine_reason"]
 
         error = None
         ws_url = cdp.cdp_ws_url(_primary_cdp_list_url(ctx))

@@ -8,14 +8,42 @@ the monolith used (its own ``secrets.key`` file -> Fernet -> DB rows).
 """
 from __future__ import annotations
 
+import logging
+
 from cryptography.fernet import Fernet, InvalidToken
 
+log = logging.getLogger("proxy_app.crypto")
+
 _SECRET_KEY_NAME = "cookie_encryption_key"
+
+
+def _table_has_rows(ctx) -> bool:
+    """Cheap existence check for the regen guard below — only ever called
+    on the (rare) path where the key is missing, so this never runs once a
+    key is established."""
+    from .cookie_store import TABLE
+
+    try:
+        rows = ctx.db.execute(TABLE, "SELECT 1 FROM {table} LIMIT 1")
+    except Exception:
+        return False
+    return bool(rows)
 
 
 def _get_or_create_key(ctx) -> bytes:
     key = ctx.secrets.read(_SECRET_KEY_NAME)
     if not key:
+        if _table_has_rows(ctx):
+            log.error(
+                "cookie_encryption_key is missing but app__proxy__persisted_cookies "
+                "already has rows — refusing to generate a replacement key, which "
+                "would silently orphan every existing cookie behind an "
+                "unrecoverable decrypt failure. This is almost certainly a transient "
+                "secrets-store read glitch, not a real first run — investigate "
+                "ctx.secrets before anything else.")
+            raise RuntimeError(
+                "cookie_encryption_key missing with existing persisted cookies — "
+                "refusing to auto-generate a replacement key")
         key = Fernet.generate_key().decode()
         ctx.secrets.write(_SECRET_KEY_NAME, key)
     return key.encode()

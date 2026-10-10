@@ -29,6 +29,9 @@ COLUMNS_SQL = (
     "same_site TEXT DEFAULT 'Lax', "
     "expires DOUBLE PRECISION, "
     "updated_at DOUBLE PRECISION, "
+    "quarantined_at DOUBLE PRECISION, "
+    "quarantine_reason TEXT, "
+    "fail_streak INTEGER NOT NULL DEFAULT 0, "
     "PRIMARY KEY (name, domain, path)"
 )
 
@@ -54,6 +57,10 @@ class CookieStore:
         return {(r[0], r[1]) for r in rows}
 
     def upsert(self, cookie: dict) -> None:
+        """A fresh sync is a new value and gets a fresh chance — resets any
+        prior quarantine (dead-key or rejected-streak) on conflict, so a
+        cookie that was marked dead can't stay silently suppressed forever
+        once the extension re-syncs it."""
         self.ctx.db.execute(
             TABLE,
             "INSERT INTO {table} "
@@ -62,7 +69,8 @@ class CookieStore:
             "ON CONFLICT (name, domain, path) DO UPDATE SET "
             "value_enc=EXCLUDED.value_enc, "
             "secure=EXCLUDED.secure, http_only=EXCLUDED.http_only, same_site=EXCLUDED.same_site, "
-            "expires=EXCLUDED.expires, updated_at=EXCLUDED.updated_at",
+            "expires=EXCLUDED.expires, updated_at=EXCLUDED.updated_at, "
+            "quarantined_at=NULL, quarantine_reason=NULL, fail_streak=0",
             {
                 "name": cookie["name"],
                 "value_enc": cookie["value_enc"],
@@ -101,14 +109,79 @@ class CookieStore:
         self.ctx.db.execute(TABLE, "DELETE FROM {table}")
         return len(rows)
 
-    def all_rows(self) -> list[dict]:
+    def all_rows(self, include_quarantined: bool = True) -> list[dict]:
+        where = "" if include_quarantined else "WHERE quarantined_at IS NULL "
         rows = self.ctx.db.execute(
             TABLE,
-            "SELECT name, value_enc, domain, path, secure, http_only, same_site, expires "
-            "FROM {table} ORDER BY name",
+            "SELECT name, value_enc, domain, path, secure, http_only, same_site, expires, "
+            "quarantined_at, quarantine_reason, fail_streak "
+            "FROM {table} " + where + "ORDER BY name",
         )
-        cols = ("name", "value_enc", "domain", "path", "secure", "http_only", "same_site", "expires")
+        cols = ("name", "value_enc", "domain", "path", "secure", "http_only", "same_site", "expires",
+                "quarantined_at", "quarantine_reason", "fail_streak")
         return [dict(zip(cols, r)) for r in rows]
+
+    def counts(self) -> dict:
+        """Persisted-cookie counts for ``/status`` — active vs quarantined."""
+        rows = self.ctx.db.execute(
+            TABLE,
+            "SELECT "
+            "SUM(CASE WHEN quarantined_at IS NULL THEN 1 ELSE 0 END), "
+            "SUM(CASE WHEN quarantined_at IS NOT NULL THEN 1 ELSE 0 END) "
+            "FROM {table}",
+        )
+        active, quarantined = rows[0] if rows else (0, 0)
+        return {"active": int(active or 0), "quarantined": int(quarantined or 0)}
+
+    def quarantine(self, name: str, domain: str, path: str, reason: str) -> None:
+        """Mark one row quarantined — never deletes, keeps it visible (with
+        its reason) in the Settings panel and ``/cookie-keys``."""
+        self.ctx.db.execute(
+            TABLE,
+            "UPDATE {table} SET quarantined_at = :now, quarantine_reason = :reason "
+            "WHERE name = :name AND domain = :domain AND path = :path",
+            {"now": time.time(), "reason": reason, "name": name, "domain": domain, "path": path},
+        )
+
+    def bump_fail_streak(self, name: str, domain: str, path: str) -> int:
+        """Increment one row's consecutive-rejection counter and return the
+        new value. Called at most once per reconcile pass, only from the
+        primary CDP target's pass (see ``plugin.py``'s reconcile loop) —
+        a secondary target's redundant pass must never double-count."""
+        self.ctx.db.execute(
+            TABLE,
+            "UPDATE {table} SET fail_streak = fail_streak + 1 "
+            "WHERE name = :name AND domain = :domain AND path = :path",
+            {"name": name, "domain": domain, "path": path},
+        )
+        rows = self.ctx.db.execute(
+            TABLE,
+            "SELECT fail_streak FROM {table} WHERE name = :name AND domain = :domain AND path = :path",
+            {"name": name, "domain": domain, "path": path},
+        )
+        return rows[0][0] if rows else 0
+
+    def delete_expired(self, grace_seconds: float = 86400) -> int:
+        """Hard-delete rows past their expiry plus a grace window — browser
+        semantics, nothing worth preserving (unlike decrypt-dead/rejected
+        rows, which are quarantined, never deleted). Session cookies
+        (``expires`` NULL) are never touched. Runs over the whole table,
+        quarantined rows included — an expired cookie is swept regardless of
+        why it was already quarantined."""
+        cutoff = time.time() - grace_seconds
+        rows = self.ctx.db.execute(
+            TABLE,
+            "SELECT name FROM {table} WHERE expires IS NOT NULL AND expires < :cutoff",
+            {"cutoff": cutoff},
+        )
+        if not rows:
+            return 0
+        self.ctx.db.execute(
+            TABLE,
+            "DELETE FROM {table} WHERE expires IS NOT NULL AND expires < :cutoff",
+            {"cutoff": cutoff},
+        )
+        return len(rows)
 
 
 def read_persisted_values_direct() -> list[dict]:
@@ -158,7 +231,8 @@ def upsert_direct(cookie: dict) -> None:
             "ON CONFLICT (name, domain, path) DO UPDATE SET "
             "value_enc=EXCLUDED.value_enc, "
             "secure=EXCLUDED.secure, http_only=EXCLUDED.http_only, same_site=EXCLUDED.same_site, "
-            "expires=EXCLUDED.expires, updated_at=EXCLUDED.updated_at"
+            "expires=EXCLUDED.expires, updated_at=EXCLUDED.updated_at, "
+            "quarantined_at=NULL, quarantine_reason=NULL, fail_streak=0"
         ), {
             "name": cookie["name"],
             "value_enc": cookie["value_enc"],

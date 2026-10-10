@@ -35,6 +35,11 @@ SERVICE_ID = "proxy-server"
 # README/2026-08-03 design note) — cheap /json/list GET, so 15s is fine.
 RECONNECT_POLL_SECONDS = 15
 
+# How many consecutive ticks of transport_failed > 0 (same target) before a
+# single "this has turned chronic" WARNING fires — 4 ticks * 15s ≈ 1 minute,
+# long enough that a one-off websocket hiccup never trips it.
+_TRANSPORT_FAILURE_CHRONIC_TICKS = 4
+
 # Mirrors aw-app.json's config_schema.allowed_networks default. AppContext.config
 # is the raw persisted/passed config dict — src/apps/base.py's AppContext never
 # merges manifest config_schema defaults into it — so an app installed with no
@@ -93,8 +98,28 @@ class ProxyAppPlugin:
 
         Iterates every configured target independently: one target being
         down (e.g. Kali not installed, or its container stopped) must not
-        skip reconciling the others."""
+        skip reconciling the others.
+
+        Logging is split three ways so a steady state (everything already
+        reconciled, same counts tick after tick) goes quiet instead of
+        repeating an identical INFO line forever:
+
+        * A newly-quarantined cookie (dead key, or a rejection that proved
+          itself non-transient) is always loud — one aggregated WARNING per
+          tick, naming every cookie quarantined this tick, since this is the
+          one case that means "a real session just became unrecoverable".
+        * The per-tick reconcile summary logs at INFO only when
+          ``(injected, rejected, transport_failed)`` changed since this
+          target's last tick, or on an unreachable→reachable edge;
+          otherwise it's DEBUG — identical counts tick after tick carry no
+          new information.
+        * A transport failure that persists for
+          ``_TRANSPORT_FAILURE_CHRONIC_TICKS`` consecutive ticks (~1 min)
+          gets exactly one WARNING marking it as turned chronic rather than
+          transient, then stays quiet until it recovers (streak resets)."""
         reachable_by_target: dict[str, bool] = {}
+        last_summary_by_target: dict[str, tuple[int, int, int]] = {}
+        transport_fail_streak_by_target: dict[str, int] = {}
         while True:
             try:
                 await asyncio.sleep(RECONNECT_POLL_SECONDS)
@@ -103,13 +128,40 @@ class ProxyAppPlugin:
                     try:
                         reachable = cdp.cdp_ws_url(target) is not None
                         if reachable:
-                            injected, failed = await asyncio.to_thread(
+                            result = await asyncio.to_thread(
                                 routes_mod.restore_persisted_cookies, self.ctx, self.store, target)
-                            if injected or failed:
-                                log.info(
-                                    "Cookie reconnect [%s]: %sreconciled %s persisted cookie(s) (%s failed)",
-                                    target, "browser back online, " if not was_reachable else "",
-                                    injected, failed)
+
+                            if result.quarantined:
+                                names = ", ".join(
+                                    f"{q['name']}@{q['domain']} ({q['reason']})"
+                                    for q in result.quarantined)
+                                log.warning(
+                                    "Cookie reconnect [%s]: quarantining %s cookie(s): %s",
+                                    target, len(result.quarantined), names)
+
+                            edge = not was_reachable
+                            summary = (result.injected, result.rejected, result.transport_failed)
+                            changed = summary != last_summary_by_target.get(target)
+                            if result.injected or result.rejected or result.decrypt_dead or result.transport_failed:
+                                log_fn = log.info if (changed or edge) else log.debug
+                                log_fn(
+                                    "Cookie reconnect [%s]: %sreconciled %s persisted cookie(s) "
+                                    "(%s rejected, %s decrypt-dead, %s transport-failed)",
+                                    target, "browser back online, " if edge else "",
+                                    result.injected, result.rejected, result.decrypt_dead,
+                                    result.transport_failed)
+                            last_summary_by_target[target] = summary
+
+                            if result.transport_failed:
+                                streak = transport_fail_streak_by_target.get(target, 0) + 1
+                                transport_fail_streak_by_target[target] = streak
+                                if streak == _TRANSPORT_FAILURE_CHRONIC_TICKS:
+                                    log.warning(
+                                        "Cookie reconnect [%s]: transport failures persisting for "
+                                        "%s consecutive ticks (~1 min) — looks chronic, not transient",
+                                        target, streak)
+                            else:
+                                transport_fail_streak_by_target[target] = 0
                         reachable_by_target[target] = reachable
                     except Exception:
                         log.warning(
